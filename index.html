@@ -564,7 +564,7 @@ body{
         <span id="statusText" style="display:none"></span>
         <div class="status"><i></i><span id="saveStatus">导入后自动保存本机草稿</span></div>
         <div class="crumb">
-          <label class="crumb"><input class="mode-switch" type="checkbox" role="switch" onchange="interactiveMode=this.checked;deselectElement()">交互模式</label>
+          <label class="crumb" title="可操作页内交互，页面跳转请使用顶部预览"><input class="mode-switch" type="checkbox" role="switch" onchange="setInteractiveMode(this.checked)">交互模式</label>
           <button class="tb-btn" onclick="zoomCanvas(-0.25)" title="缩小网页" aria-label="缩小网页">−</button>
           <span id="zoomLevel">100%</span>
           <button class="tb-btn" onclick="zoomCanvas(0.25)" title="放大网页" aria-label="放大网页">+</button>
@@ -587,7 +587,7 @@ body{
 
         <!-- Iframe wrapper (behind welcome screen) -->
         <div id="iframeWrap">
-          <iframe id="canvasIframe" class="canvas-hidden"></iframe>
+          <iframe id="canvasIframe" class="canvas-hidden" sandbox="allow-scripts allow-same-origin allow-forms allow-modals"></iframe>
         </div>
       </div>
     </section>
@@ -662,6 +662,7 @@ const DRAFT_PREFIX = 'html-editor:draft:';
 const LAST_DRAFT_KEY = 'html-editor:last-draft';
 let currentDraftKey = '';
 let saveTimer = null;
+let previewDocument = null;
 
 function getTranslate(el) {
   const t = el.style.transform;
@@ -677,7 +678,8 @@ function getTranslate(el) {
    ======================================================================== */
 function getDoc() {
   const iframe = document.getElementById('canvasIframe');
-  return iframe && iframe.contentDocument;
+  const doc = iframe && iframe.contentDocument;
+  return doc === previewDocument ? doc : null;
 }
 function getWin() {
   const iframe = document.getElementById('canvasIframe');
@@ -694,11 +696,23 @@ function getRoot() {
 function loadHTML(htmlString) {
   clearTimeout(saveTimer);
   hasLoadedDocument = false;
+  previewDocument = null;
   setSaveStatus('正在载入...');
+  // Install navigation guards before the imported page's scripts can run.
+  const source = new DOMParser().parseFromString(htmlString, 'text/html');
+  const guard = source.createElement('script');
+  guard.textContent = 'parent.guardPreview(document);document.currentScript.remove();';
+  source.head.prepend(guard);
   return new Promise((resolve, reject) => {
     const iframe = document.getElementById('canvasIframe');
     iframe.onload = () => {
       try {
+        if (!getDoc()) {
+          hasLoadedDocument = false;
+          iframe.classList.add('canvas-hidden');
+          setSaveStatus('页面已跳转，请重新导入以恢复草稿', '#ef4444');
+          return reject(new Error('Preview document was replaced'));
+        }
         setupIframeListeners();
         createHandles();
         autoSizeIframe();
@@ -706,8 +720,53 @@ function loadHTML(htmlString) {
         resolve();
       } catch (e) { reject(e); }
     };
-    iframe.srcdoc = htmlString;
+    iframe.srcdoc = (source.doctype ? new XMLSerializer().serializeToString(source.doctype) : '') + source.documentElement.outerHTML;
   });
+}
+
+function guardPreview(doc) {
+  previewDocument = doc;
+  const win = doc.defaultView;
+  const blocked = () => showToast('画布内已阻止页面跳转，请使用顶部“预览”');
+  win.navigation?.addEventListener('navigate', e => {
+    if (doc !== previewDocument || e.destination.sameDocument || !e.cancelable) return;
+    e.preventDefault();
+    blocked();
+  });
+  // Run after page click handlers so dropdowns/tabs can handle their own links.
+  const onLink = e => {
+    const link = e.target.closest?.('a[href], area[href]');
+    if (!link || e.defaultPrevented) return;
+    e.preventDefault();
+    if (!interactiveMode) return;
+    const href = link.getAttribute('href').trim();
+    if (e.type === 'click' && href.startsWith('#')) win.location.hash = href;
+    else if (href && !/^javascript:\s*void\s*\(/i.test(href)) blocked();
+  };
+  win.addEventListener('click', onLink);
+  win.addEventListener('auxclick', onLink);
+  doc.addEventListener('submit', e => {
+    if (e.defaultPrevented || (e.submitter?.formMethod || e.target.method) === 'dialog') return;
+    e.preventDefault();
+    blocked();
+  }, true);
+  // form.submit() bypasses the submit event; dialog forms must still close normally.
+  const submit = win.HTMLFormElement.prototype.submit;
+  win.HTMLFormElement.prototype.submit = function () {
+    if (this.method === 'dialog') return submit.call(this);
+    blocked();
+  };
+  // Preserve the last editable document even if a browser cannot cancel navigation.
+  win.addEventListener('beforeunload', () => {
+    if (doc === previewDocument) flushDraft();
+  });
+}
+
+function setInteractiveMode(enabled) {
+  flushDraft();
+  interactiveMode = enabled;
+  deselectElement();
+  autoSizeIframe();
 }
 
 function zoomCanvas(step) {
