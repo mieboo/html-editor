@@ -166,6 +166,10 @@ body{
   font-size:13px;
   font-weight:800;
 }
+.mode-switch{appearance:none;width:32px;height:18px;flex-shrink:0;margin:0;border:0;border-radius:18px;background:var(--line2);cursor:pointer}
+.mode-switch::before{content:"";display:block;width:14px;height:14px;margin:2px;border-radius:50%;background:#fff;transition:transform .15s}
+.mode-switch:checked{background:var(--accent)}
+.mode-switch:checked::before{transform:translateX(14px)}
 .status{
   display:flex;
   align-items:center;
@@ -545,6 +549,7 @@ body{
     <span class="tb-spacer"></span>
 
     <div class="actions" style="display:flex;align-items:center;gap:6px">
+      <button class="tb-btn" onclick="exportFile(true)" title="在新标签页预览">预览</button>
       <button class="tb-btn dark" onclick="exportFile()">导出 HTML</button>
       <button class="tb-btn" onclick="exportPNG()">导出 PNG</button>
       <button class="tb-btn" onclick="composeImage()">合成图片</button>
@@ -559,6 +564,7 @@ body{
         <span id="statusText" style="display:none"></span>
         <div class="status"><i></i> 自动保存已开启</div>
         <div class="crumb">
+          <label class="crumb"><input class="mode-switch" type="checkbox" role="switch" onchange="interactiveMode=this.checked;deselectElement()">交互模式</label>
           <button class="tb-btn" onclick="zoomCanvas(-0.25)" title="缩小网页" aria-label="缩小网页">−</button>
           <span id="zoomLevel">100%</span>
           <button class="tb-btn" onclick="zoomCanvas(0.25)" title="放大网页" aria-label="放大网页">+</button>
@@ -651,6 +657,7 @@ let _toastTimer = null;
 let _mutationObserver = null;
 let _scrubState = null;
 let _moveData = null;
+let interactiveMode = false;
 
 function getTranslate(el) {
   const t = el.style.transform;
@@ -722,10 +729,14 @@ function setupIframeListeners() {
   const doc = getDoc();
   if (!doc) return;
 
-  // Click to select (bubbling phase, no capture)
+  // Capture page actions in edit mode; leave them untouched in interactive mode.
+  doc.addEventListener('pointerdown', e => { if (!interactiveMode) e.stopPropagation(); }, true);
   doc.addEventListener('click', (e) => {
+    if (interactiveMode) return;
+    e.stopPropagation();
     if (resizeData) return;
     if (editSavedContent !== null) return;
+    e.preventDefault();
     if (_justMoved) { _justMoved = false; return; }
     let el = e.target;
     // Walk up from text nodes to their parent element
@@ -734,7 +745,6 @@ function setupIframeListeners() {
     if (el.classList.contains('__ve-handle')) return;
     if (el === doc.body || el === doc.documentElement) { deselectElement(); return; }
     if (['INPUT','TEXTAREA','SELECT'].includes(el.tagName)) return;
-    if (el.tagName === 'A' || el.closest('a')) { e.preventDefault(); }
     // Already-selected text element → second click enters edit mode
     if (el === selectedElement) {
       if (isTextElement(el)) {
@@ -744,13 +754,16 @@ function setupIframeListeners() {
       return;
     }
     selectElement(el);
-  });
+  }, true);
 
   // Mousedown on selected element → prepare drag-to-move (not on handles)
   doc.addEventListener('mousedown', (e) => {
+    if (interactiveMode || e.target.classList.contains('__ve-handle')) return;
+    e.stopPropagation();
     if (e.button !== 0) return;
     if (resizeData) return;
     if (editSavedContent !== null) return;
+    e.preventDefault();
     if (_scrubState) return;
     _justMoved = false;
     let el = e.target;
@@ -772,7 +785,7 @@ function setupIframeListeners() {
         wasStatic: !el.style.position || el.style.position === 'static'
       };
     }
-  });
+  }, true);
 
   // Scroll inside iframe → update handle positions
   const win = getWin();
@@ -1526,13 +1539,14 @@ function loadFile(file) {
   reader.readAsText(file);
 }
 
-async function exportFile() {
+async function exportFile(preview = false) {
   deselectElement();
   const doc = getDoc();
   if (!doc) { showToast('没有可导出的内容'); return; }
   const html = getDocHTML().replace(/<div class="__ve-handle"[^>]*><\/div>/g, '');
   const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
   const url = URL.createObjectURL(blob);
+  if (preview) { window.open(url, '_blank', 'noopener'); return; }
   const a = document.createElement('a');
   a.href = url; a.download = 'index.html';
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
