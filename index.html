@@ -558,6 +558,11 @@ body{
       <div class="stage-head">
         <span id="statusText" style="display:none"></span>
         <div class="status"><i></i> 自动保存已开启</div>
+        <div class="crumb">
+          <button class="tb-btn" onclick="zoomCanvas(-0.25)" title="缩小网页" aria-label="缩小网页">−</button>
+          <span id="zoomLevel">100%</span>
+          <button class="tb-btn" onclick="zoomCanvas(0.25)" title="放大网页" aria-label="放大网页">+</button>
+        </div>
       </div>
 
       <div class="canvas-wrap" id="canvasContainer">
@@ -688,6 +693,15 @@ function loadHTML(htmlString) {
     };
     iframe.srcdoc = htmlString;
   });
+}
+
+function zoomCanvas(step) {
+  const iframe = document.getElementById('canvasIframe');
+  const zoom = Math.min(2, Math.max(0.25, (parseFloat(iframe.style.zoom) || 1) + step));
+  iframe.style.zoom = zoom;
+  document.getElementById('zoomLevel').textContent = Math.round(zoom * 100) + '%';
+  autoSizeIframe();
+  if (selectedElement) showHandles(selectedElement);
 }
 
 function autoSizeIframe() {
