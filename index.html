@@ -188,7 +188,7 @@ body{
   min-height:0;
   padding:24px;
   position:relative;
-  overflow-y:auto;
+  overflow:auto;
   background:
     linear-gradient(rgba(17,17,17,.035) 1px,transparent 1px),
     linear-gradient(90deg,rgba(17,17,17,.035) 1px,transparent 1px);
@@ -706,6 +706,7 @@ function zoomCanvas(step) {
   const iframe = document.getElementById('canvasIframe');
   const zoom = Math.min(2, Math.max(0.25, (parseFloat(iframe.style.zoom) || 1) + step));
   iframe.style.zoom = zoom;
+  document.getElementById('iframeWrap').style.width = Math.max(1, zoom) * 100 + '%';
   document.getElementById('zoomLevel').textContent = Math.round(zoom * 100) + '%';
   autoSizeIframe();
   if (selectedElement) showHandles(selectedElement);
