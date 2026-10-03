@@ -549,7 +549,8 @@ body{
     <span class="tb-spacer"></span>
 
     <div class="actions" style="display:flex;align-items:center;gap:6px">
-      <button class="tb-btn" onclick="document.getElementById('fileInput').click()">打开 HTML</button>
+      <button class="tb-btn" onclick="openFile()">打开 HTML</button>
+      <button class="tb-btn" id="btnSave" onclick="saveFile()" title="保存到源 HTML 文件">保存</button>
       <button class="tb-btn" onclick="exportFile(true)" title="在新标签页预览">预览</button>
       <button class="tb-btn dark" onclick="exportFile()">导出 HTML</button>
       <button class="tb-btn" onclick="exportPNG()">导出 PNG</button>
@@ -580,7 +581,7 @@ body{
             <h1>把 HTML 拖进来，开始像设计稿一样编辑</h1>
 
             <div class="drop-actions">
-              <button class="upload-btn" onclick="event.stopPropagation();document.getElementById('fileInput').click()">导入 HTML</button>
+              <button class="upload-btn" onclick="event.stopPropagation();openFile()">导入 HTML</button>
 
             </div>
           </div>
@@ -665,6 +666,8 @@ let currentDraftKey = '';
 let saveTimer = null;
 let previewDocument = null;
 let openingFile = false;
+let sourceFileHandle = null;
+const HTML_FILE_TYPES = [{ accept: { 'text/html': ['.html', '.htm'] } }];
 
 function getTranslate(el) {
   const t = el.style.transform;
@@ -1637,17 +1640,33 @@ window.addEventListener('dragleave', (e) => {
     if (welcomeDropZone) welcomeDropZone.classList.remove('drag-over');
   }
 }, true);
-function handleFileDrop(e) {
+async function handleFileDrop(e) {
   _preventDrag(e);
   if (welcomeDropZone) welcomeDropZone.classList.remove('drag-over');
   const file = e.dataTransfer?.files?.[0];
-  if (file && isValidHTMLFile(file)) loadFile(file);
+  if (file && isValidHTMLFile(file)) {
+    const item = Array.from(e.dataTransfer.items).find(item => item.kind === 'file');
+    const handle = item?.getAsFileSystemHandle?.();
+    loadFile(file, await handle?.catch(() => null));
+  }
 }
 window.addEventListener('drop', handleFileDrop, true);
 
 // Welcome dropzone click triggers file input
 if (welcomeDropZone) {
-  welcomeDropZone.addEventListener('click', () => document.getElementById('fileInput').click());
+  welcomeDropZone.addEventListener('click', openFile);
+}
+
+async function openFile() {
+  if (!window.showOpenFilePicker) return document.getElementById('fileInput').click();
+  try {
+    const [handle] = await window.showOpenFilePicker({ types: HTML_FILE_TYPES });
+    const file = await handle.getFile();
+    if (isValidHTMLFile(file)) await loadFile(file, handle);
+    else showToast('请选择 HTML 文件');
+  } catch (e) {
+    if (e.name !== 'AbortError') showToast('打开失败: ' + e.message);
+  }
 }
 
 function handleFileSelect(e) {
@@ -1658,7 +1677,7 @@ function handleFileSelect(e) {
 
 function isValidHTMLFile(file) { return file.name.endsWith('.html') || file.name.endsWith('.htm') || file.type === 'text/html'; }
 
-async function loadFile(file) {
+async function loadFile(file, handle = null) {
   if (openingFile) { showToast('请先完成当前文件的打开操作'); return; }
   openingFile = true;
   try {
@@ -1678,11 +1697,37 @@ async function loadFile(file) {
       if (confirm(`“${file.name}”已有同名草稿，是否恢复？\n确定：恢复草稿。\n取消：选择打开原文件。`)) html = draft.html;
       else if (!confirm('打开原文件将替换该文件的当前草稿。确定继续？')) return;
     }
-    await startEditing(html, key);
+    await startEditing(html, key, handle);
   } catch (err) {
     showToast('打开失败: ' + err.message);
     console.error(err);
   } finally { openingFile = false; }
+}
+
+async function saveFile() {
+  const doc = getDoc(), button = document.getElementById('btnSave');
+  if (!doc) { showToast('没有可保存的内容'); return; }
+  if (button.disabled) return;
+  if (!sourceFileHandle && !window.showSaveFilePicker) { showToast('当前浏览器不支持直接写回文件，请使用“导出 HTML”'); return; }
+  button.disabled = true;
+  let handle = sourceFileHandle, writable;
+  try {
+    flushDraft();
+    const html = getDocHTML();
+    if (!handle) {
+      let name = 'index.html';
+      try { name = JSON.parse(currentDraftKey.slice(DRAFT_PREFIX.length))[0] || name; } catch (e) {}
+      handle = await window.showSaveFilePicker({ suggestedName: name, types: HTML_FILE_TYPES });
+    }
+    writable = await handle.createWritable();
+    await writable.write(html);
+    await writable.close();
+    if (getDoc() === doc) sourceFileHandle = handle;
+    showToast('已保存 ' + handle.name);
+  } catch (e) {
+    await writable?.abort().catch(() => {});
+    if (e.name !== 'AbortError' || handle) showToast('保存失败: ' + e.message);
+  } finally { button.disabled = false; }
 }
 
 async function exportFile(preview = false) {
@@ -1859,7 +1904,7 @@ document.addEventListener('keydown', (e) => {
   if (editSavedContent !== null) return;
   if ((e.ctrlKey||e.metaKey) && e.key==='z' && !e.shiftKey) { e.preventDefault(); undo(); }
   if ((e.ctrlKey||e.metaKey) && (e.key==='y'||(e.key==='z'&&e.shiftKey))) { e.preventDefault(); redo(); }
-  if ((e.ctrlKey||e.metaKey) && e.key==='s') { e.preventDefault(); exportFile(); }
+  if ((e.ctrlKey||e.metaKey) && e.key==='s') { e.preventDefault(); saveFile(); }
   if ((e.key==='Delete'||e.key==='Backspace') && selectedElement && document.activeElement===document.body) {
     e.preventDefault(); deleteSelected();
   }
@@ -1935,11 +1980,12 @@ document.getElementById('propsBody').addEventListener('input', scheduleSave);
    ======================================================================== */
 let hasLoadedDocument = false;
 
-async function startEditing(htmlString, key = DRAFT_PREFIX + 'sample') {
+async function startEditing(htmlString, key = DRAFT_PREFIX + 'sample', handle = null) {
   flushDraft();
   deselectElement();
   editSavedContent = null;
   currentDraftKey = key;
+  sourceFileHandle = handle;
   document.getElementById('welcomeScreen').classList.add('hidden');
   document.getElementById('canvasIframe').classList.remove('canvas-hidden');
   document.getElementById('editorTools').style.display = 'flex';
