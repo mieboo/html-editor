@@ -128,12 +128,6 @@ body{
 }
 .tb-btn.dark:hover{background:#2a2a2a}
 .tb-spacer{flex:1}
-#draftDialog{width:min(480px,calc(100% - 32px));padding:24px;border:1px solid var(--line);border-radius:22px;background:var(--paper);color:var(--ink)}
-#draftDialog::backdrop{background:rgba(0,0,0,.4)}
-#draftDialog h2{margin:0;font-size:20px}
-#draftDialog p{line-height:1.6;color:var(--muted);overflow-wrap:anywhere}
-#draftDialog select{display:block;width:100%;margin:8px 0 20px;padding:10px;font:inherit}
-#draftDialog .choices{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 
 /* ===== Main layout ===== */
 .layout{
@@ -632,21 +626,6 @@ body{
 </div>
 
 <div id="toast"></div>
-
-<dialog id="draftDialog" aria-labelledby="draftTitle" aria-describedby="draftDescription">
-  <form method="dialog">
-    <h2 id="draftTitle">发现同名文件的本机草稿</h2>
-    <p id="draftDescription"></p>
-    <p>请选择要编辑的版本。打开原文件会另存草稿，已有草稿会保留。</p>
-    <label for="draftChoice">可恢复的草稿</label>
-    <select id="draftChoice"></select>
-    <div class="choices">
-      <button class="tb-btn" value="cancel" autofocus>取消</button>
-      <button class="tb-btn" value="draft">恢复所选草稿</button>
-      <button class="tb-btn dark" value="file">打开原文件</button>
-    </div>
-  </form>
-</dialog>
 
 <!-- About modal -->
 <div id="aboutModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:10000;align-items:center;justify-content:center">
@@ -1679,52 +1658,27 @@ function handleFileSelect(e) {
 
 function isValidHTMLFile(file) { return file.name.endsWith('.html') || file.name.endsWith('.htm') || file.type === 'text/html'; }
 
-function chooseDraft(file, drafts) {
-  const dialog = document.getElementById('draftDialog');
-  const select = document.getElementById('draftChoice');
-  document.getElementById('draftDescription').textContent = `“${file.name}”已有草稿。原文件可能已在外部修改，也可能是另一个目录下的同名文件。`;
-  select.replaceChildren(...drafts.map(draft => new Option(
-    draft.savedAt ? '保存于 ' + new Date(draft.savedAt).toLocaleString() : '旧版草稿 · 原文件修改于 ' + new Date(draft.modified).toLocaleString(),
-    draft.key
-  )));
-  dialog.returnValue = 'cancel';
-  return new Promise(resolve => {
-    dialog.addEventListener('close', () => resolve(
-      dialog.returnValue === 'draft' ? drafts[select.selectedIndex] : dialog.returnValue === 'file' ? 'file' : 'cancel'
-    ), { once: true });
-    dialog.showModal();
-  });
-}
-
 async function loadFile(file) {
   if (openingFile) { showToast('请先完成当前文件的打开操作'); return; }
   openingFile = true;
   try {
     let html = await file.text();
     if (!flushDraft() && !confirm('当前修改未能保存。请先取消并导出 HTML，或确认放弃未保存的修改并继续打开文件。')) return;
-    const identity = [file.name, file.size, file.lastModified];
-    let key = DRAFT_PREFIX + JSON.stringify(identity);
-    const drafts = [];
+    const prefix = DRAFT_PREFIX + '[' + JSON.stringify(file.name);
+    let key = prefix + ']', draft = null;
     try {
+      // Reuse the latest draft, including keys written by earlier versions.
       for (const storedKey of Object.keys(localStorage)) {
-        if (!storedKey.startsWith(DRAFT_PREFIX)) continue;
-        try {
-          const [name, , modified] = JSON.parse(storedKey.slice(DRAFT_PREFIX.length));
-          const draft = name === file.name && readDraft(storedKey);
-          if (draft) drafts.push({ ...draft, key: storedKey, modified });
-        } catch (e) {}
+        if (!storedKey.startsWith(prefix)) continue;
+        const saved = readDraft(storedKey);
+        if (saved && (!draft || saved.savedAt > draft.savedAt)) { draft = saved; key = storedKey; }
       }
     } catch (e) {}
-    drafts.sort((a, b) => (b.savedAt - a.savedAt) || Number(b.key === key) - Number(a.key === key));
-    let restored = false;
-    if (drafts.length) {
-      const choice = await chooseDraft(file, drafts);
-      if (choice === 'cancel') return;
-      if (choice === 'file') key = DRAFT_PREFIX + JSON.stringify([...identity, Date.now()]);
-      else { html = choice.html; key = choice.key; restored = true; }
+    if (draft) {
+      if (confirm(`“${file.name}”已有同名草稿，是否恢复？\n确定：恢复草稿。\n取消：选择打开原文件。`)) html = draft.html;
+      else if (!confirm('打开原文件将替换该文件的当前草稿。确定继续？')) return;
     }
     await startEditing(html, key);
-    if (restored) showToast('已恢复所选草稿');
   } catch (err) {
     showToast('打开失败: ' + err.message);
     console.error(err);
@@ -1902,7 +1856,6 @@ function addElement(type) {
    KEYBOARD SHORTCUTS
    ======================================================================== */
 document.addEventListener('keydown', (e) => {
-  if (document.getElementById('draftDialog').open) return;
   if (editSavedContent !== null) return;
   if ((e.ctrlKey||e.metaKey) && e.key==='z' && !e.shiftKey) { e.preventDefault(); undo(); }
   if ((e.ctrlKey||e.metaKey) && (e.key==='y'||(e.key==='z'&&e.shiftKey))) { e.preventDefault(); redo(); }
