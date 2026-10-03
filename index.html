@@ -551,6 +551,7 @@ body{
     <div class="actions" style="display:flex;align-items:center;gap:6px">
       <button class="tb-btn" onclick="openFile()">打开 HTML</button>
       <button class="tb-btn" id="btnSave" onclick="saveFile()" title="保存到源 HTML 文件">保存</button>
+      <button class="tb-btn" onclick="refreshFile()" title="重新读取源 HTML 文件">刷新</button>
       <button class="tb-btn" onclick="exportFile(true)" title="在新标签页预览">预览</button>
       <button class="tb-btn dark" onclick="exportFile()">导出 HTML</button>
       <button class="tb-btn" onclick="exportPNG()">导出 PNG</button>
@@ -1677,10 +1678,11 @@ function handleFileSelect(e) {
 
 function isValidHTMLFile(file) { return file.name.endsWith('.html') || file.name.endsWith('.htm') || file.type === 'text/html'; }
 
-async function loadFile(file, handle = null) {
+async function loadFile(file, handle = null, fromSource = false) {
   if (openingFile) { showToast('请先完成当前文件的打开操作'); return; }
   openingFile = true;
   try {
+    file ||= await handle.getFile();
     let html = await file.text();
     if (!flushDraft() && !confirm('当前修改未能保存。请先取消并导出 HTML，或确认放弃未保存的修改并继续打开文件。')) return;
     const prefix = DRAFT_PREFIX + '[' + JSON.stringify(file.name);
@@ -1693,7 +1695,7 @@ async function loadFile(file, handle = null) {
         if (saved && (!draft || saved.savedAt > draft.savedAt)) { draft = saved; key = storedKey; }
       }
     } catch (e) {}
-    if (draft) {
+    if (draft && !fromSource) {
       if (confirm(`“${file.name}”已有同名草稿，是否恢复？\n确定：恢复草稿。\n取消：选择打开原文件。`)) html = draft.html;
       else if (!confirm('打开原文件将替换该文件的当前草稿。确定继续？')) return;
     }
@@ -1704,9 +1706,16 @@ async function loadFile(file, handle = null) {
   } finally { openingFile = false; }
 }
 
+function refreshFile() {
+  if (openingFile || document.getElementById('btnSave').disabled) { showToast('请等待当前文件操作完成'); return; }
+  if (!sourceFileHandle) { showToast('请先通过“打开 HTML”重新选择源文件'); return; }
+  if (confirm('从源文件刷新会替换当前编辑和本机草稿，是否继续？')) loadFile(null, sourceFileHandle, true);
+}
+
 async function saveFile() {
   const doc = getDoc(), button = document.getElementById('btnSave');
   if (!doc) { showToast('没有可保存的内容'); return; }
+  if (openingFile) { showToast('文件正在载入，请稍后保存'); return; }
   if (button.disabled) return;
   if (!sourceFileHandle && !window.showSaveFilePicker) { showToast('当前浏览器不支持直接写回文件，请使用“导出 HTML”'); return; }
   button.disabled = true;
