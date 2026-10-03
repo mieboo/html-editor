@@ -128,6 +128,12 @@ body{
 }
 .tb-btn.dark:hover{background:#2a2a2a}
 .tb-spacer{flex:1}
+#draftDialog{width:min(480px,calc(100% - 32px));padding:24px;border:1px solid var(--line);border-radius:22px;background:var(--paper);color:var(--ink)}
+#draftDialog::backdrop{background:rgba(0,0,0,.4)}
+#draftDialog h2{margin:0;font-size:20px}
+#draftDialog p{line-height:1.6;color:var(--muted);overflow-wrap:anywhere}
+#draftDialog select{display:block;width:100%;margin:8px 0 20px;padding:10px;font:inherit}
+#draftDialog .choices{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 
 /* ===== Main layout ===== */
 .layout{
@@ -549,6 +555,7 @@ body{
     <span class="tb-spacer"></span>
 
     <div class="actions" style="display:flex;align-items:center;gap:6px">
+      <button class="tb-btn" onclick="document.getElementById('fileInput').click()">打开 HTML</button>
       <button class="tb-btn" onclick="exportFile(true)" title="在新标签页预览">预览</button>
       <button class="tb-btn dark" onclick="exportFile()">导出 HTML</button>
       <button class="tb-btn" onclick="exportPNG()">导出 PNG</button>
@@ -626,6 +633,21 @@ body{
 
 <div id="toast"></div>
 
+<dialog id="draftDialog" aria-labelledby="draftTitle" aria-describedby="draftDescription">
+  <form method="dialog">
+    <h2 id="draftTitle">发现同名文件的本机草稿</h2>
+    <p id="draftDescription"></p>
+    <p>请选择要编辑的版本。打开原文件会另存草稿，已有草稿会保留。</p>
+    <label for="draftChoice">可恢复的草稿</label>
+    <select id="draftChoice"></select>
+    <div class="choices">
+      <button class="tb-btn" value="cancel" autofocus>取消</button>
+      <button class="tb-btn" value="draft">恢复所选草稿</button>
+      <button class="tb-btn dark" value="file">打开原文件</button>
+    </div>
+  </form>
+</dialog>
+
 <!-- About modal -->
 <div id="aboutModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:10000;align-items:center;justify-content:center">
   <div style="background:#fbfaf6;border-radius:24px;padding:32px;max-width:380px;width:90%;text-align:center;box-shadow:0 28px 80px rgba(0,0,0,.18);border:1px solid #e4dfd5">
@@ -663,6 +685,7 @@ const LAST_DRAFT_KEY = 'html-editor:last-draft';
 let currentDraftKey = '';
 let saveTimer = null;
 let previewDocument = null;
+let openingFile = false;
 
 function getTranslate(el) {
   const t = el.style.transform;
@@ -727,6 +750,13 @@ function loadHTML(htmlString) {
 function guardPreview(doc) {
   previewDocument = doc;
   const win = doc.defaultView;
+  // Drops inside an iframe do not bubble to the editor window.
+  win.addEventListener('dragover', e => {
+    if (e.dataTransfer?.types.includes('Files')) _preventDrag(e);
+  }, true);
+  win.addEventListener('drop', e => {
+    if (e.dataTransfer?.files.length) handleFileDrop(e);
+  }, true);
   const blocked = () => showToast('画布内已阻止页面跳转，请使用顶部“预览”');
   win.navigation?.addEventListener('navigate', e => {
     if (doc !== previewDocument || e.destination.sameDocument || !e.cancelable) return;
@@ -1522,6 +1552,16 @@ async function setDocHTML(html) {
   saveDraft();
 }
 
+function readDraft(key) {
+  const raw = localStorage.getItem(key);
+  if (raw === null) return null;
+  try {
+    const draft = JSON.parse(raw);
+    if (typeof draft?.html === 'string') return draft;
+  } catch (e) {}
+  return { html: raw, savedAt: 0 }; // Existing drafts contain plain HTML.
+}
+
 function setSaveStatus(message, color = '#d4a017') {
   const status = document.getElementById('saveStatus');
   status.textContent = message;
@@ -1541,7 +1581,7 @@ function saveDraft() {
   try {
     const html = getDocHTML();
     if (!html) throw new Error('No document to save');
-    localStorage.setItem(currentDraftKey, html);
+    localStorage.setItem(currentDraftKey, JSON.stringify({ html, savedAt: Date.now() }));
     localStorage.setItem(LAST_DRAFT_KEY, currentDraftKey);
     setSaveStatus('本机草稿已保存', '#21c55d');
     return true;
@@ -1618,15 +1658,13 @@ window.addEventListener('dragleave', (e) => {
     if (welcomeDropZone) welcomeDropZone.classList.remove('drag-over');
   }
 }, true);
-window.addEventListener('drop', (e) => {
+function handleFileDrop(e) {
   _preventDrag(e);
   if (welcomeDropZone) welcomeDropZone.classList.remove('drag-over');
   const file = e.dataTransfer?.files?.[0];
   if (file && isValidHTMLFile(file)) loadFile(file);
-}, true);
-
-// Also prevent drop on the iframe
-document.getElementById('canvasIframe').addEventListener('drop', _preventDrag, true);
+}
+window.addEventListener('drop', handleFileDrop, true);
 
 // Welcome dropzone click triggers file input
 if (welcomeDropZone) {
@@ -1641,19 +1679,56 @@ function handleFileSelect(e) {
 
 function isValidHTMLFile(file) { return file.name.endsWith('.html') || file.name.endsWith('.htm') || file.type === 'text/html'; }
 
-function loadFile(file) {
-  const reader = new FileReader();
-  reader.onload = async (e) => {
+function chooseDraft(file, drafts) {
+  const dialog = document.getElementById('draftDialog');
+  const select = document.getElementById('draftChoice');
+  document.getElementById('draftDescription').textContent = `“${file.name}”已有草稿。原文件可能已在外部修改，也可能是另一个目录下的同名文件。`;
+  select.replaceChildren(...drafts.map(draft => new Option(
+    draft.savedAt ? '保存于 ' + new Date(draft.savedAt).toLocaleString() : '旧版草稿 · 原文件修改于 ' + new Date(draft.modified).toLocaleString(),
+    draft.key
+  )));
+  dialog.returnValue = 'cancel';
+  return new Promise(resolve => {
+    dialog.addEventListener('close', () => resolve(
+      dialog.returnValue === 'draft' ? drafts[select.selectedIndex] : dialog.returnValue === 'file' ? 'file' : 'cancel'
+    ), { once: true });
+    dialog.showModal();
+  });
+}
+
+async function loadFile(file) {
+  if (openingFile) { showToast('请先完成当前文件的打开操作'); return; }
+  openingFile = true;
+  try {
+    let html = await file.text();
+    if (!flushDraft() && !confirm('当前修改未能保存。请先取消并导出 HTML，或确认放弃未保存的修改并继续打开文件。')) return;
+    const identity = [file.name, file.size, file.lastModified];
+    let key = DRAFT_PREFIX + JSON.stringify(identity);
+    const drafts = [];
     try {
-      showToast('正在加载...');
-      const key = DRAFT_PREFIX + JSON.stringify([file.name, file.size, file.lastModified]);
-      await startEditing(e.target.result, key);
-    } catch (err) {
-      showToast('解析失败: ' + err.message);
-      console.error(err);
+      for (const storedKey of Object.keys(localStorage)) {
+        if (!storedKey.startsWith(DRAFT_PREFIX)) continue;
+        try {
+          const [name, , modified] = JSON.parse(storedKey.slice(DRAFT_PREFIX.length));
+          const draft = name === file.name && readDraft(storedKey);
+          if (draft) drafts.push({ ...draft, key: storedKey, modified });
+        } catch (e) {}
+      }
+    } catch (e) {}
+    drafts.sort((a, b) => (b.savedAt - a.savedAt) || Number(b.key === key) - Number(a.key === key));
+    let restored = false;
+    if (drafts.length) {
+      const choice = await chooseDraft(file, drafts);
+      if (choice === 'cancel') return;
+      if (choice === 'file') key = DRAFT_PREFIX + JSON.stringify([...identity, Date.now()]);
+      else { html = choice.html; key = choice.key; restored = true; }
     }
-  };
-  reader.readAsText(file);
+    await startEditing(html, key);
+    if (restored) showToast('已恢复所选草稿');
+  } catch (err) {
+    showToast('打开失败: ' + err.message);
+    console.error(err);
+  } finally { openingFile = false; }
 }
 
 async function exportFile(preview = false) {
@@ -1827,6 +1902,7 @@ function addElement(type) {
    KEYBOARD SHORTCUTS
    ======================================================================== */
 document.addEventListener('keydown', (e) => {
+  if (document.getElementById('draftDialog').open) return;
   if (editSavedContent !== null) return;
   if ((e.ctrlKey||e.metaKey) && e.key==='z' && !e.shiftKey) { e.preventDefault(); undo(); }
   if ((e.ctrlKey||e.metaKey) && (e.key==='y'||(e.key==='z'&&e.shiftKey))) { e.preventDefault(); redo(); }
@@ -1908,19 +1984,17 @@ let hasLoadedDocument = false;
 
 async function startEditing(htmlString, key = DRAFT_PREFIX + 'sample') {
   flushDraft();
-  let draft = null;
-  try { draft = localStorage.getItem(key); } catch (e) {}
   deselectElement();
   editSavedContent = null;
   currentDraftKey = key;
   document.getElementById('welcomeScreen').classList.add('hidden');
   document.getElementById('canvasIframe').classList.remove('canvas-hidden');
   document.getElementById('editorTools').style.display = 'flex';
-  await loadHTML(draft ?? htmlString);
+  await loadHTML(htmlString);
   undoStack = []; redoStack = [];
   updateUndoRedoButtons();
   saveDraft();
-  showToast(draft !== null ? '已恢复本机草稿' : '已加载');
+  showToast('已加载');
 }
 
 // After welcome screen transition ends, remove it from layout
@@ -1943,8 +2017,11 @@ async function init() {
   updateUndoRedoButtons();
   try {
     const key = localStorage.getItem(LAST_DRAFT_KEY);
-    const html = key && localStorage.getItem(key);
-    if (html) await startEditing(html, key);
+    const draft = key && readDraft(key);
+    if (draft) {
+      await startEditing(draft.html, key);
+      showToast('已恢复本机草稿');
+    }
   } catch (e) {
     setSaveStatus('本机草稿不可用，请导出 HTML', '#ef4444');
   }
