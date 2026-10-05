@@ -308,6 +308,9 @@ body{
 }
 
 /* ===== Props panel ===== */
+.group-arrow{position:absolute;display:grid;place-items:center;width:22px;height:22px;transform:translate(-50%,-50%);border:1px solid #6d5dfc;border-radius:50%;background:#fff;color:#6d5dfc;font:700 16px/1 sans-serif;box-shadow:0 2px 6px #0002}
+.group-arrow[data-active]{background:#6d5dfc;color:#fff;outline:3px solid #6d5dfc40}
+
 .props{
   border:1px solid var(--line);
   background:rgba(251,250,246,.76);
@@ -801,6 +804,7 @@ function autoSizeIframe() {
   const h = Math.max(600, doc.body.scrollHeight + 80);
   iframe.style.minHeight = h + 'px';
   wrap.scrollTop = st;
+  if (_moveData?.moved) drawGroupTargets();
 }
 
 /* ========================================================================
@@ -863,6 +867,7 @@ function setupIframeListeners() {
         startY: e.clientY,
         startLeft: parseFloat(el.style.left) || 0,
         startTop: parseFloat(el.style.top) || 0,
+        originalStyle: el.getAttribute('style'),
         startTx: tr,
         moved: false,
         wasStatic: !el.style.position || el.style.position === 'static'
@@ -875,6 +880,7 @@ function setupIframeListeners() {
   if (win) {
     win.addEventListener('blur', onDragUp);
     win.addEventListener('scroll', () => {
+      if (_moveData?.moved) drawGroupTargets();
       if (selectedElement) showHandles(selectedElement);
     });
   }
@@ -1019,6 +1025,106 @@ let _resizeRAF = null;
 let _moveRAF = null;
 let _justMoved = false;
 
+function movePoint(e) {
+  const frame = document.getElementById('canvasIframe'), rect = frame.getBoundingClientRect();
+  const zoom = parseFloat(frame.style.zoom) || 1;
+  const outside = e.view === window || e.target?.ownerDocument === document;
+  return { x: outside ? (e.clientX - rect.left) / zoom : e.clientX, y: outside ? (e.clientY - rect.top) / zoom : e.clientY,
+    clientX: outside ? e.clientX : rect.left + e.clientX * zoom, clientY: outside ? e.clientY : rect.top + e.clientY * zoom };
+}
+
+function groupTag(target, dragged) {
+  if (!target.isConnected || !dragged.isConnected || target.contains(dragged) || dragged.contains(target)) return;
+  if (target.closest('.__ve-handle') || [target, dragged].some(el => el.namespaceURI !== 'http://www.w3.org/1999/xhtml' && el.tagName !== 'svg')) return;
+  if (/^(SCRIPT|STYLE|LINK|META|TEMPLATE|BR)$/.test(target.tagName)) return;
+  const parent = target.parentElement;
+  if (!parent || parent.namespaceURI !== 'http://www.w3.org/1999/xhtml' || /^(HTML|HEAD|TABLE|THEAD|TBODY|TFOOT|TR|COLGROUP|UL|OL|MENU|DL|SELECT|OPTGROUP|PICTURE)$/.test(parent.tagName)) return;
+  if (target.closest('a,button') && (dragged.matches('a,button,input,select,textarea') || dragged.querySelector('a,button,input,select,textarea'))) return;
+  const inline = /^(P|H[1-6]|SPAN|A|BUTTON|LABEL|PRE|EM|STRONG|B|I|U|S|SMALL|CODE|SUB|SUP|MARK|TIME|ABBR)$/;
+  if (inline.test(parent.tagName)) {
+    if (![target, dragged].every(el => inline.test(el.tagName) || /^(IMG|INPUT|TEXTAREA|SELECT|SVG|CANVAS)$/.test(el.tagName.toUpperCase()))) return;
+    if ([target, dragged].some(el => /^(P|H[1-6]|PRE)$/.test(el.tagName))) return;
+    return 'span';
+  }
+  return 'div';
+}
+
+function drawGroupTargets() {
+  const move = _moveData;
+  if (!move?.moved) return;
+  if (!move.overlay) {
+    move.targets = [...getDoc().body.querySelectorAll('*')].filter(el => groupTag(el, move.el));
+    move.markers = new Map();
+    move.overlay = document.createElement('div');
+    move.overlay.id = 'groupDropTargets';
+    move.overlay.setAttribute('aria-hidden', 'true');
+    move.overlay.style.cssText = 'position:fixed;overflow:hidden;pointer-events:none;z-index:2000';
+    document.body.appendChild(move.overlay);
+  }
+  const frame = document.getElementById('canvasIframe'), f = frame.getBoundingClientRect();
+  const view = document.getElementById('canvasContainer').getBoundingClientRect(), zoom = parseFloat(frame.style.zoom) || 1;
+  move.view = view;
+  Object.assign(move.overlay.style, { left: view.left + 'px', top: view.top + 'px', width: view.width + 'px', height: view.height + 'px' });
+  move.points = [];
+  for (const target of move.targets) {
+    const r = target.getBoundingClientRect();
+    const left = f.left + r.left * zoom, top = f.top + r.top * zoom, right = left + r.width * zoom, bottom = top + r.height * zoom;
+    const visible = target.isConnected && r.width > 0 && r.height > 0 && right > view.left && left < view.right && bottom > view.top && top < view.bottom && getWin().getComputedStyle(target).visibility === 'visible';
+    let markers = move.markers.get(target);
+    if (!visible) { markers?.forEach(el => el.remove()); move.markers.delete(target); continue; }
+    if (!markers) {
+      markers = ['←', '↑', '→', '↓'].map(text => {
+        const marker = document.createElement('span');
+        marker.className = 'group-arrow'; marker.textContent = text;
+        move.overlay.appendChild(marker); return marker;
+      });
+      move.markers.set(target, markers);
+    }
+    const ix = Math.min(12, r.width * zoom / 4), iy = Math.min(12, r.height * zoom / 4);
+    [[left + ix, (top + bottom) / 2], [(left + right) / 2, top + iy], [right - ix, (top + bottom) / 2], [(left + right) / 2, bottom - iy]].forEach(([x, y], side) => {
+      const marker = markers[side];
+      marker.style.left = (x - view.left) + 'px'; marker.style.top = (y - view.top) + 'px';
+      if (x >= view.left && x <= view.right && y >= view.top && y <= view.bottom) move.points.push({ target, side, marker, x, y });
+    });
+  }
+  updateGroupTarget();
+}
+
+function updateGroupTarget() {
+  const move = _moveData;
+  if (!move?.point) return;
+  const x = move.point.clientX, y = move.point.clientY;
+  const view = move.view;
+  let drop = null, distance = x >= view.left && x <= view.right && y >= view.top && y <= view.bottom ? 15 : -1;
+  for (const point of move.points || []) {
+    const d = Math.hypot(point.x - x, point.y - y);
+    if (d <= distance) { distance = d; drop = point; }
+  }
+  if (drop?.marker !== move.drop?.marker) {
+    move.drop?.marker.removeAttribute('data-active');
+    drop?.marker.setAttribute('data-active', '');
+  }
+  move.drop = drop;
+}
+
+function groupElements(dragged, target, side) {
+  const tag = groupTag(target, dragged);
+  if (!tag) return false;
+  const parentStyle = getWin().getComputedStyle(target.parentElement);
+  const group = getDoc().createElement(tag), horizontal = side % 2 === 0;
+  group.style.cssText = 'display:' + (tag === 'span' ? 'inline-flex' : 'flex') + ';min-width:0;flex-wrap:nowrap';
+  group.style.flexDirection = horizontal ? (parentStyle.direction === 'rtl' ? 'row-reverse' : 'row') : 'column';
+  group.style.gap = parentStyle.gap;
+  target.before(group);
+  group.append(...(side < 2 ? [dragged, target] : [target, dragged]));
+  for (const el of [dragged, target]) {
+    el.style.position = 'relative'; el.style.inset = 'auto'; el.style.order = '0';
+  }
+  selectElement(group);
+  showToast(horizontal ? '已创建横向组合容器' : '已创建纵向组合容器');
+  return true;
+}
+
 // Central drag-move handler — works on BOTH parent and iframe documents
 function onDragMove(e) {
   // Mouseup can be lost outside the window or intercepted by the imported page.
@@ -1061,8 +1167,10 @@ function onDragMove(e) {
 
   // Handle drag-to-move
   if (_moveData) {
-    const dx = e.clientX - _moveData.startX;
-    const dy = e.clientY - _moveData.startY;
+    const point = movePoint(e);
+    _moveData.point = point;
+    const dx = point.x - _moveData.startX;
+    const dy = point.y - _moveData.startY;
     if (Math.abs(dx) < 3 && Math.abs(dy) < 3 && !_moveData.moved) return;
     if (!_moveData.moved) {
       _moveData.moved = true;
@@ -1110,7 +1218,7 @@ function onDragMove(e) {
   }
 }
 
-function onDragUp() {
+function onDragUp(e) {
   if (resizeData) {
     resizeData = null;
     if (_resizeRAF) { cancelAnimationFrame(_resizeRAF); _resizeRAF = null; }
@@ -1122,7 +1230,7 @@ function onDragUp() {
     autoSizeIframe();
     if (selectedElement) showHandles(selectedElement);
   }
-  if (_moveData) finishMove();
+  if (_moveData) finishMove(e);
   finishScrub();
 }
 
@@ -1135,9 +1243,12 @@ function finishScrub() {
   if (didMove) pushUndo();
 }
 
-function finishMove() {
+function finishMove(e, cancel = false) {
   if (!_moveData) return;
   const move = _moveData, el = move.el;
+  if (e?.type === 'mouseup' && move.moved) { move.point = movePoint(e); drawGroupTargets(); }
+  const drop = e?.type === 'mouseup' ? move.drop : null;
+  move.overlay?.remove();
   _moveData = null;
   el.style.cursor = '';
   document.body.style.cursor = '';
@@ -1148,8 +1259,13 @@ function finishMove() {
     el.style.boxShadow = move._savedBoxShadow || '';
     el.style.transition = move._savedTransition || '';
     el.style.zIndex = move._savedZIndex || '';
+    if (cancel || (drop && groupTag(drop.target, el))) {
+      if (move.originalStyle === null) el.removeAttribute('style');
+      else el.setAttribute('style', move.originalStyle);
+      if (!cancel) { deselectElement(); groupElements(el, drop.target, drop.side); }
+    }
     _justMoved = true;
-    pushUndo();
+    if (!cancel) pushUndo();
     autoSizeIframe();
     if (el === selectedElement && el.isConnected) { showHandles(el); el.style.cursor = 'move'; }
   }
@@ -1158,6 +1274,7 @@ function finishMove() {
 
 document.addEventListener('mousemove', onDragMove);
 document.addEventListener('mouseup', onDragUp, true);
+document.getElementById('canvasContainer').addEventListener('scroll', drawGroupTargets);
 window.addEventListener('blur', onDragUp);
 
 /* ========================================================================
@@ -1968,6 +2085,7 @@ function addElement(type) {
    KEYBOARD SHORTCUTS
    ======================================================================== */
 function onShortcut(e) {
+  if (e.key === 'Escape' && _moveData) { e.preventDefault(); finishMove(null, true); return; }
   if ((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==='z' && !e.shiftKey) { e.preventDefault(); undo(); }
   if ((e.ctrlKey||e.metaKey) && (e.key.toLowerCase()==='y'||(e.key.toLowerCase()==='z'&&e.shiftKey))) { e.preventDefault(); redo(); }
   if ((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==='s') { e.preventDefault(); saveFile(); }
