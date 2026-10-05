@@ -658,6 +658,7 @@ let editSavedContent = null;
 let handles = [];
 let _toastTimer = null;
 let _mutationObserver = null;
+let _sizeRAF = null;
 let _scrubState = null;
 let _moveData = null;
 let interactiveMode = false;
@@ -795,6 +796,8 @@ function autoSizeIframe() {
   const wrap = document.getElementById('canvasContainer');
   if (!doc || !doc.body) return;
   const st = wrap.scrollTop;
+  // Measure from a fixed viewport so 100vh pages cannot grow on every edit.
+  iframe.style.minHeight = '600px';
   const h = Math.max(600, doc.body.scrollHeight + 80);
   iframe.style.minHeight = h + 'px';
   wrap.scrollTop = st;
@@ -870,6 +873,7 @@ function setupIframeListeners() {
   // Scroll inside iframe → update handle positions
   const win = getWin();
   if (win) {
+    win.addEventListener('blur', onDragUp);
     win.addEventListener('scroll', () => {
       if (selectedElement) showHandles(selectedElement);
     });
@@ -877,14 +881,17 @@ function setupIframeListeners() {
 
   // Drag move/up inside iframe — critical for smooth resize (iframe has own event context)
   doc.addEventListener('mousemove', onDragMove);
-  doc.addEventListener('mouseup', onDragUp);
+  doc.addEventListener('mouseup', onDragUp, true);
 
   // Mutation observer to auto-resize iframe
   if (doc.body) {
     if (_mutationObserver) _mutationObserver.disconnect();
     _mutationObserver = new MutationObserver(() => {
-      if (resizeData) return;
-      autoSizeIframe();
+      if (resizeData || _sizeRAF) return;
+      _sizeRAF = requestAnimationFrame(() => {
+        _sizeRAF = null;
+        if (getDoc() === doc && !resizeData) autoSizeIframe();
+      });
     });
     _mutationObserver.observe(doc.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style'] });
   }
@@ -1014,6 +1021,8 @@ let _justMoved = false;
 
 // Central drag-move handler — works on BOTH parent and iframe documents
 function onDragMove(e) {
+  // Mouseup can be lost outside the window or intercepted by the imported page.
+  if (!(e.buttons & 1)) { onDragUp(); return; }
   // Handle resize drag
   if (resizeData) {
     const { el, dir, startX, startY, startW, startH, startLeft, startTop, wasStatic, isInline } = resizeData;
@@ -1052,7 +1061,6 @@ function onDragMove(e) {
 
   // Handle drag-to-move
   if (_moveData) {
-    if (!(e.buttons & 1)) { finishMove(); return; }
     const dx = e.clientX - _moveData.startX;
     const dy = e.clientY - _moveData.startY;
     if (Math.abs(dx) < 3 && Math.abs(dy) < 3 && !_moveData.moved) return;
@@ -1089,7 +1097,6 @@ function onDragMove(e) {
 
   // Handle label scrub
   if (_scrubState) {
-    if (!(e.buttons & 1)) { finishScrub(); return; }
     const { input, axis, startX, startY, startVal, unit } = _scrubState;
     const delta = axis === 'x' ? (e.clientX - startX) : (e.clientY - startY);
     if (Math.abs(delta) < 3 && !_scrubState.moved) return;
@@ -1150,7 +1157,8 @@ function finishMove() {
 }
 
 document.addEventListener('mousemove', onDragMove);
-document.addEventListener('mouseup', onDragUp);
+document.addEventListener('mouseup', onDragUp, true);
+window.addEventListener('blur', onDragUp);
 
 /* ========================================================================
    INLINE TEXT EDITING
@@ -1170,7 +1178,7 @@ function isInlineText(el) {
 
 // Click-to-edit: place cursor at click position (called via setTimeout to defer past click processing)
 function startEditAtCursor(el, cx, cy) {
-  if (!selectedElement) selectElement(el);
+  if (interactiveMode || selectedElement !== el || !el.isConnected || editSavedContent !== null) return;
   hideHandles();
   el.style.outline = '2px solid #f59e0b';
   el.style.outlineOffset = '2px';
@@ -1178,7 +1186,13 @@ function startEditAtCursor(el, cx, cy) {
   editSavedContent = el.innerHTML;
 
   const doc = getDoc();
+  el.addEventListener('blur', onEditBlur);
+  el.addEventListener('keydown', onEditKey);
   el.focus();
+  if (doc.activeElement !== el) {
+    if (editSavedContent !== null) onEditBlur({ target: el });
+    return;
+  }
 
   try {
     const range = doc.caretRangeFromPoint(cx, cy);
@@ -1188,27 +1202,27 @@ function startEditAtCursor(el, cx, cy) {
       sel.addRange(range);
     }
   } catch(e) {}
-
-  el.addEventListener('blur', onEditBlur);
-  el.addEventListener('keydown', onEditKey);
 }
 
 // Double-click: select all text for quick replacement
 function startEditFull(el) {
   selectElement(el);
   el.contentEditable = 'true';
-  el.focus();
   editSavedContent = el.innerHTML;
 
   const doc = getDoc();
+  el.addEventListener('blur', onEditBlur);
+  el.addEventListener('keydown', onEditKey);
+  el.focus();
+  if (doc.activeElement !== el) {
+    if (editSavedContent !== null) onEditBlur({ target: el });
+    return;
+  }
   const range = doc.createRange();
   range.selectNodeContents(el);
   const sel = getWin().getSelection();
   sel.removeAllRanges();
   sel.addRange(range);
-
-  el.addEventListener('blur', onEditBlur);
-  el.addEventListener('keydown', onEditKey);
 }
 
 function onEditBlur(e) {
