@@ -551,7 +551,6 @@ body{
     <div class="actions" style="display:flex;align-items:center;gap:6px">
       <button class="tb-btn" onclick="openFile()">打开 HTML</button>
       <button class="tb-btn" id="btnSave" onclick="saveFile()" title="保存到源 HTML 文件">保存</button>
-      <button class="tb-btn" onclick="refreshFile()" title="重新读取源 HTML 文件">刷新</button>
       <button class="tb-btn" onclick="exportFile(true)" title="在新标签页预览">预览</button>
       <button class="tb-btn dark" onclick="exportFile()">导出 HTML</button>
       <button class="tb-btn" onclick="exportPNG()">导出 PNG</button>
@@ -565,7 +564,7 @@ body{
     <section class="stage">
       <div class="stage-head">
         <span id="statusText" style="display:none"></span>
-        <div class="status"><i></i><span id="saveStatus">导入后自动保存本机草稿</span></div>
+        <div class="status"><i></i><span id="saveStatus" title="当前文件保留最近 300 步撤销；关闭编辑器或切换文件后清空">打开源文件后自动保存，每 3 秒检查更新</span></div>
         <div class="crumb">
           <label class="crumb" title="可操作页内交互，页面跳转请使用顶部预览"><input class="mode-switch" type="checkbox" role="switch" onchange="setInteractiveMode(this.checked)">交互模式</label>
           <button class="tb-btn" onclick="zoomCanvas(-0.25)" title="缩小网页" aria-label="缩小网页">−</button>
@@ -651,6 +650,7 @@ body{
    STATE
    ======================================================================== */
 let selectedElement = null;
+let selectionState = null;
 let undoStack = [];
 let redoStack = [];
 let resizeData = null;
@@ -661,13 +661,13 @@ let _mutationObserver = null;
 let _scrubState = null;
 let _moveData = null;
 let interactiveMode = false;
-const DRAFT_PREFIX = 'html-editor:draft:';
-const LAST_DRAFT_KEY = 'html-editor:last-draft';
-let currentDraftKey = '';
 let saveTimer = null;
 let previewDocument = null;
 let openingFile = false;
 let sourceFileHandle = null;
+let sourceFileName = 'index.html';
+let historyHTML = '', savedHTML = '', sourceHTML = '';
+let fileTask = Promise.resolve(), fileOperations = 0, syncing = false;
 const HTML_FILE_TYPES = [{ accept: { 'text/html': ['.html', '.htm'] } }];
 
 function getTranslate(el) {
@@ -716,7 +716,7 @@ function loadHTML(htmlString) {
         if (!getDoc()) {
           hasLoadedDocument = false;
           iframe.classList.add('canvas-hidden');
-          setSaveStatus('页面已跳转，请重新导入以恢复草稿', '#ef4444');
+          setSaveStatus('页面已跳转，请重新打开源文件', '#ef4444');
           return reject(new Error('Preview document was replaced'));
         }
         setupIframeListeners();
@@ -769,14 +769,11 @@ function guardPreview(doc) {
     if (this.method === 'dialog') return submit.call(this);
     blocked();
   };
-  // Preserve the last editable document even if a browser cannot cancel navigation.
-  win.addEventListener('beforeunload', () => {
-    if (doc === previewDocument) flushDraft();
-  });
+  win.addEventListener('beforeunload', () => { if (doc === previewDocument) finishEditing(); });
 }
 
 function setInteractiveMode(enabled) {
-  flushDraft();
+  finishEditing();
   interactiveMode = enabled;
   deselectElement();
   autoSizeIframe();
@@ -810,6 +807,7 @@ function setupIframeListeners() {
   const doc = getDoc();
   if (!doc) return;
   doc.addEventListener('input', scheduleSave, true);
+  doc.addEventListener('keydown', onShortcut, true);
 
   // Capture page actions in edit mode; leave them untouched in interactive mode.
   doc.addEventListener('pointerdown', e => { if (!interactiveMode) e.stopPropagation(); }, true);
@@ -951,6 +949,10 @@ function hideHandles() {
 function selectElement(el) {
   deselectElement();
   selectedElement = el;
+  selectionState = {
+    styles: ['outline', 'outline-offset', 'cursor'].map(p => [p, el.style.getPropertyValue(p), el.style.getPropertyPriority(p)]),
+    editable: el.getAttribute('contenteditable'), style: el.getAttribute('style'), cssText: el.style.cssText
+  };
   el.style.outline = '2px solid #6d5dfc';
   el.style.outlineOffset = '2px';
   el.style.cursor = 'move';
@@ -960,11 +962,20 @@ function selectElement(el) {
   document.getElementById('statusText').textContent = '已选中';
 }
 
+function restoreSelection(el) {
+  selectionState.styles.forEach(([p, value, priority]) => el.style.setProperty(p, value, priority));
+  if (selectionState.editable === null) el.removeAttribute('contenteditable');
+  else el.setAttribute('contenteditable', selectionState.editable);
+  if (el.style.cssText === selectionState.cssText) {
+    if (selectionState.style === null) el.removeAttribute('style');
+    else el.setAttribute('style', selectionState.style);
+  }
+}
+
 function deselectElement() {
   if (selectedElement && selectedElement.isConnected) {
-    selectedElement.style.outline = '';
-    selectedElement.style.outlineOffset = '';
-    selectedElement.style.cursor = '';
+    if (editSavedContent !== null) selectedElement.blur();
+    restoreSelection(selectedElement);
   }
   selectedElement = null;
   hideHandles();
@@ -1119,22 +1130,22 @@ function finishScrub() {
 
 function finishMove() {
   if (!_moveData) return;
-  const el = _moveData.el;
+  const move = _moveData, el = move.el;
+  _moveData = null;
   el.style.cursor = '';
   document.body.style.cursor = '';
-  if (_moveData.moved) {
+  if (move.moved) {
     // Restore visual state
-    el.style.outline = _moveData._savedOutline || '';
-    el.style.outlineOffset = _moveData._savedOutlineOffset || '';
-    el.style.boxShadow = _moveData._savedBoxShadow || '';
-    el.style.transition = _moveData._savedTransition || '';
-    el.style.zIndex = _moveData._savedZIndex || '';
+    el.style.outline = move._savedOutline || '';
+    el.style.outlineOffset = move._savedOutlineOffset || '';
+    el.style.boxShadow = move._savedBoxShadow || '';
+    el.style.transition = move._savedTransition || '';
+    el.style.zIndex = move._savedZIndex || '';
     _justMoved = true;
     pushUndo();
     autoSizeIframe();
     if (el === selectedElement && el.isConnected) { showHandles(el); el.style.cursor = 'move'; }
   }
-  _moveData = null;
   if (_moveRAF) { cancelAnimationFrame(_moveRAF); _moveRAF = null; }
 }
 
@@ -1184,7 +1195,7 @@ function startEditAtCursor(el, cx, cy) {
 
 // Double-click: select all text for quick replacement
 function startEditFull(el) {
-  deselectElement();
+  selectElement(el);
   el.contentEditable = 'true';
   el.focus();
   editSavedContent = el.innerHTML;
@@ -1212,7 +1223,7 @@ function onEditKey(e) {
 }
 
 function commitEdit(el) {
-  el.contentEditable = 'false';
+  restoreSelection(el);
   if (el === selectedElement) {
     el.style.outline = '2px solid #6d5dfc';
     el.style.outlineOffset = '2px';
@@ -1514,7 +1525,7 @@ function deleteSelected() {
 /* ========================================================================
    UNDO / REDO (HTML snapshots of the iframe document)
    ======================================================================== */
-const MAX_UNDO = 50;
+const MAX_UNDO = 300;
 
 function getDocHTML() {
   const doc = getDoc();
@@ -1522,28 +1533,79 @@ function getDocHTML() {
   const root = doc.documentElement.cloneNode(true);
   const index = Array.from(doc.querySelectorAll('*')).indexOf(selectedElement);
   const selected = index === 0 ? root : root.querySelectorAll('*')[index - 1];
-  if (selected) {
-    ['outline', 'outlineOffset', 'cursor'].forEach(prop => selected.style[prop] = '');
-    if (editSavedContent !== null) selected.removeAttribute('contenteditable');
-  }
+  if (selected) restoreSelection(selected);
   root.querySelectorAll('.__ve-handle').forEach(el => el.remove());
-  return '<!DOCTYPE html>\n' + root.outerHTML;
+  return (doc.doctype ? new XMLSerializer().serializeToString(doc.doctype) + '\n' : '') + root.outerHTML;
+}
+
+function remember(html) {
+  undoStack.push(html);
+  if (undoStack.length > MAX_UNDO) undoStack.shift();
+}
+
+// Store the previous state, not the just-edited state; ignore unchanged snapshots.
+function recordChange() {
+  if (!hasLoadedDocument || resizeData || _moveData || _scrubState) return false;
+  const html = getDocHTML();
+  if (!html || html === historyHTML) return false;
+  remember(historyHTML);
+  historyHTML = html;
+  redoStack = [];
+  updateUndoRedoButtons();
+  return true;
+}
+
+function pushUndo() {
+  clearTimeout(saveTimer);
+  if (recordChange()) syncSource();
+}
+
+function scheduleSave() {
+  if (!hasLoadedDocument) return;
+  clearTimeout(saveTimer);
+  setSaveStatus('修改待写入源文件…');
+  saveTimer = setTimeout(pushUndo, 300);
+}
+
+function finishEditing() {
+  if (!hasLoadedDocument) return;
+  getDoc()?.activeElement?.blur();
+  onDragUp();
+  pushUndo();
+}
+
+// Serialize disk access, history restores and file switches.
+function queueFileTask(action) {
+  fileOperations++;
+  fileTask = fileTask.then(action).catch(e => {
+    setSaveStatus('文件同步失败，请保存重试：' + e.message, '#ef4444');
+    return false;
+  }).finally(() => fileOperations--);
+  return fileTask;
 }
 
 async function setDocHTML(html) {
+  deselectElement();
   await loadHTML(html);
-  saveDraft();
+  historyHTML = getDocHTML();
 }
 
-function readDraft(key) {
-  const raw = localStorage.getItem(key);
-  if (raw === null) return null;
-  try {
-    const draft = JSON.parse(raw);
-    if (typeof draft?.html === 'string') return draft;
-  } catch (e) {}
-  return { html: raw, savedAt: 0 }; // Existing drafts contain plain HTML.
+function restoreHistory(isRedo = false) {
+  if (openingFile) return;
+  return queueFileTask(async () => {
+    finishEditing();
+    const from = isRedo ? redoStack : undoStack, to = isRedo ? undoStack : redoStack;
+    if (!from.length) return;
+    const html = from[from.length - 1], current = historyHTML;
+    await setDocHTML(html);
+    from.pop();
+    to.push(current);
+    updateUndoRedoButtons();
+    syncSource();
+  });
 }
+function undo() { return restoreHistory(); }
+function redo() { return restoreHistory(true); }
 
 function setSaveStatus(message, color = '#d4a017') {
   const status = document.getElementById('saveStatus');
@@ -1551,63 +1613,63 @@ function setSaveStatus(message, color = '#d4a017') {
   status.parentElement.style.setProperty('--save-color', color);
 }
 
-function scheduleSave() {
-  if (!hasLoadedDocument || !currentDraftKey) return;
-  clearTimeout(saveTimer);
-  setSaveStatus('本机草稿待保存...');
-  saveTimer = setTimeout(saveDraft, 300);
-}
-
-function saveDraft() {
-  clearTimeout(saveTimer);
-  if (!hasLoadedDocument || !currentDraftKey) return true;
-  try {
-    const html = getDocHTML();
-    if (!html) throw new Error('No document to save');
-    localStorage.setItem(currentDraftKey, JSON.stringify({ html, savedAt: Date.now() }));
-    localStorage.setItem(LAST_DRAFT_KEY, currentDraftKey);
-    setSaveStatus('本机草稿已保存', '#21c55d');
-    return true;
-  } catch (e) {
-    setSaveStatus('草稿保存失败，请导出 HTML', '#ef4444');
-    return false;
-  }
-}
-
-function flushDraft() {
-  if (hasLoadedDocument) {
-    getDoc()?.activeElement?.blur();
-    onDragUp();
-  }
-  return saveDraft();
-}
-
-async function pushUndo() {
-  const doc = getDoc();
-  if (!doc) return;
-  undoStack.push(getDocHTML());
-  if (undoStack.length > MAX_UNDO) undoStack.shift();
-  redoStack = [];
-  updateUndoRedoButtons();
-  scheduleSave();
-}
-
-async function undo() {
-  if (undoStack.length === 0) return;
-  redoStack.push(getDocHTML());
-  const html = undoStack.pop();
-  deselectElement();
-  await setDocHTML(html);
-  updateUndoRedoButtons();
-}
-
-async function redo() {
-  if (redoStack.length === 0) return;
-  undoStack.push(getDocHTML());
-  const html = redoStack.pop();
-  deselectElement();
-  await setDocHTML(html);
-  updateUndoRedoButtons();
+function syncSource() {
+  if (syncing) return fileTask;
+  syncing = true;
+  return queueFileTask(async () => {
+    let writable;
+    try {
+      if (!hasLoadedDocument && historyHTML === savedHTML) return;
+      if (!sourceFileHandle) {
+        setSaveStatus(window.showSaveFilePicker ? '请点击“保存”关联源文件' : '浏览器不支持文件同步，请导出 HTML');
+        return false;
+      }
+      do {
+        const disk = await (await sourceFileHandle.getFile()).text();
+        if (resizeData || _moveData || _scrubState) return;
+        if (disk !== sourceHTML) {
+          recordChange();
+          if (historyHTML !== savedHTML) {
+            // Concurrent external edits remain recoverable instead of disappearing.
+            remember(disk);
+            showToast('源文件同时发生修改，外部版本已保留，可撤销恢复');
+          } else {
+            if (editSavedContent !== null || document.getElementById('propsBody').contains(document.activeElement)) return;
+            const previous = historyHTML;
+            await setDocHTML(disk);
+            remember(previous);
+            savedHTML = historyHTML;
+          }
+          sourceHTML = disk;
+          redoStack = [];
+          updateUndoRedoButtons();
+        }
+        if (historyHTML !== savedHTML) {
+          if (await sourceFileHandle.queryPermission({ mode: 'readwrite' }) !== 'granted') {
+            setSaveStatus('未获写入权限，点击“保存”授权', '#ef4444');
+            return false;
+          }
+          const html = historyHTML;
+          setSaveStatus('正在保存源文件…');
+          writable = await sourceFileHandle.createWritable();
+          await writable.write(html);
+          if (await (await sourceFileHandle.getFile()).text() !== sourceHTML) {
+            await writable.abort();
+            writable = null;
+            continue;
+          }
+          await writable.close();
+          writable = null;
+          sourceHTML = savedHTML = html;
+        }
+      } while (historyHTML !== savedHTML);
+      setSaveStatus(hasLoadedDocument ? '源文件已同步 · 每 3 秒检查更新' : '源文件已保存，请重新打开', '#21c55d');
+      return true;
+    } finally {
+      await writable?.abort().catch(() => {});
+      syncing = false;
+    }
+  });
 }
 
 function updateUndoRedoButtons() {
@@ -1678,64 +1740,45 @@ function handleFileSelect(e) {
 
 function isValidHTMLFile(file) { return file.name.endsWith('.html') || file.name.endsWith('.htm') || file.type === 'text/html'; }
 
-async function loadFile(file, handle = null, fromSource = false) {
-  if (openingFile) { showToast('请先完成当前文件的打开操作'); return; }
+async function loadFile(file, handle = null) {
+  if (openingFile || document.getElementById('btnSave').disabled) { showToast('请等待当前文件操作完成'); return; }
   openingFile = true;
   try {
-    file ||= await handle.getFile();
-    let html = await file.text();
-    if (!flushDraft() && !confirm('当前修改未能保存。请先取消并导出 HTML，或确认放弃未保存的修改并继续打开文件。')) return;
-    const prefix = DRAFT_PREFIX + '[' + JSON.stringify(file.name);
-    let key = prefix + ']', draft = null;
-    try {
-      // Reuse the latest draft, including keys written by earlier versions.
-      for (const storedKey of Object.keys(localStorage)) {
-        if (!storedKey.startsWith(prefix)) continue;
-        const saved = readDraft(storedKey);
-        if (saved && (!draft || saved.savedAt > draft.savedAt)) { draft = saved; key = storedKey; }
-      }
-    } catch (e) {}
-    if (draft && !fromSource) {
-      if (confirm(`“${file.name}”已有同名草稿，是否恢复？\n确定：恢复草稿。\n取消：选择打开原文件。`)) html = draft.html;
-      else if (!confirm('打开原文件将替换该文件的当前草稿。确定继续？')) return;
-    }
-    await startEditing(html, key, handle);
-  } catch (err) {
-    showToast('打开失败: ' + err.message);
-    console.error(err);
+    // Ask while the open/drop gesture is still active; background saves never prompt.
+    await handle?.requestPermission({ mode: 'readwrite' }).catch(() => {});
+    finishEditing();
+    await syncSource();
+    await queueFileTask(async () => {
+      if (historyHTML !== savedHTML && !confirm('当前修改尚未写入源文件，是否放弃并打开其他文件？')) return;
+      if (handle) file = await handle.getFile();
+      await startEditing(await file.text(), handle, file.name);
+    });
   } finally { openingFile = false; }
 }
 
-function refreshFile() {
-  if (openingFile || document.getElementById('btnSave').disabled) { showToast('请等待当前文件操作完成'); return; }
-  if (!sourceFileHandle) { showToast('请先通过“打开 HTML”重新选择源文件'); return; }
-  if (confirm('从源文件刷新会替换当前编辑和本机草稿，是否继续？')) loadFile(null, sourceFileHandle, true);
-}
-
 async function saveFile() {
-  const doc = getDoc(), button = document.getElementById('btnSave');
-  if (!doc) { showToast('没有可保存的内容'); return; }
-  if (openingFile) { showToast('文件正在载入，请稍后保存'); return; }
-  if (button.disabled) return;
+  const button = document.getElementById('btnSave');
+  if (!getDoc()) { showToast('没有可保存的内容'); return; }
+  if (openingFile || button.disabled) return;
   if (!sourceFileHandle && !window.showSaveFilePicker) { showToast('当前浏览器不支持直接写回文件，请使用“导出 HTML”'); return; }
   button.disabled = true;
-  let handle = sourceFileHandle, writable;
   try {
-    flushDraft();
-    const html = getDocHTML();
-    if (!handle) {
-      let name = 'index.html';
-      try { name = JSON.parse(currentDraftKey.slice(DRAFT_PREFIX.length))[0] || name; } catch (e) {}
-      handle = await window.showSaveFilePicker({ suggestedName: name, types: HTML_FILE_TYPES });
+    const handle = sourceFileHandle || await window.showSaveFilePicker({ suggestedName: sourceFileName, types: HTML_FILE_TYPES });
+    if (await handle.requestPermission({ mode: 'readwrite' }) !== 'granted') {
+      setSaveStatus('未获写入权限，点击“保存”授权', '#ef4444');
+      return;
     }
-    writable = await handle.createWritable();
-    await writable.write(html);
-    await writable.close();
-    if (getDoc() === doc) sourceFileHandle = handle;
-    showToast('已保存 ' + handle.name);
+    finishEditing();
+    await queueFileTask(async () => {
+      if (!sourceFileHandle) {
+        sourceHTML = await (await handle.getFile()).text();
+        sourceFileHandle = handle;
+        savedHTML = ''; // The first save must also write an otherwise unedited file.
+      }
+    });
+    if (await syncSource()) showToast('已保存 ' + handle.name);
   } catch (e) {
-    await writable?.abort().catch(() => {});
-    if (e.name !== 'AbortError' || handle) showToast('保存失败: ' + e.message);
+    if (e.name !== 'AbortError') setSaveStatus('保存失败：' + e.message, '#ef4444');
   } finally { button.disabled = false; }
 }
 
@@ -1827,9 +1870,10 @@ document.addEventListener('click', (e) => {
 
 function resetAll() {
   if (!selectedElement) return;
-  selectedElement.style.cssText = '';
-  selectedElement.style.transform = '';
-  updatePropsPanel(selectedElement);
+  const el = selectedElement;
+  deselectElement();
+  el.removeAttribute('style');
+  selectElement(el);
   pushUndo();
   showToast('已重置全部样式');
 }
@@ -1849,7 +1893,6 @@ function toggleAddPanel() {
 function addElement(type) {
   const doc = getDoc();
   if (!doc || !doc.body) return;
-  pushUndo();
 
   let el;
   switch (type) {
@@ -1900,6 +1943,7 @@ function addElement(type) {
     }
     autoSizeIframe();
     selectElement(el);
+    pushUndo();
     showToast('已添加');
   }
 
@@ -1909,16 +1953,17 @@ function addElement(type) {
 /* ========================================================================
    KEYBOARD SHORTCUTS
    ======================================================================== */
-document.addEventListener('keydown', (e) => {
-  if (editSavedContent !== null) return;
-  if ((e.ctrlKey||e.metaKey) && e.key==='z' && !e.shiftKey) { e.preventDefault(); undo(); }
-  if ((e.ctrlKey||e.metaKey) && (e.key==='y'||(e.key==='z'&&e.shiftKey))) { e.preventDefault(); redo(); }
-  if ((e.ctrlKey||e.metaKey) && e.key==='s') { e.preventDefault(); saveFile(); }
+function onShortcut(e) {
+  if ((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==='z' && !e.shiftKey) { e.preventDefault(); undo(); }
+  if ((e.ctrlKey||e.metaKey) && (e.key.toLowerCase()==='y'||(e.key.toLowerCase()==='z'&&e.shiftKey))) { e.preventDefault(); redo(); }
+  if ((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==='s') { e.preventDefault(); saveFile(); }
+  if (editSavedContent !== null || e.target.ownerDocument !== document) return;
   if ((e.key==='Delete'||e.key==='Backspace') && selectedElement && document.activeElement===document.body) {
     e.preventDefault(); deleteSelected();
   }
   if (e.key==='Escape') { deselectElement(); document.getElementById('addPanel').classList.remove('show'); }
-});
+}
+document.addEventListener('keydown', onShortcut);
 
 /* ========================================================================
    HELPERS
@@ -1977,11 +2022,11 @@ document.getElementById('propsBody').addEventListener('mousedown', (e) => {
 
 // Redundant — onDragUp already registered above; kept as comment for clarity
 
-// Flush pending edits before a refresh or navigation; warn if saving fails.
+// File writes are asynchronous; keep the tab open until pending edits reach disk.
 window.addEventListener('beforeunload', (e) => {
-  if (!flushDraft()) { e.preventDefault(); e.returnValue = ''; }
+  finishEditing();
+  if (fileOperations || historyHTML !== savedHTML) { e.preventDefault(); e.returnValue = ''; }
 });
-window.addEventListener('pagehide', flushDraft);
 document.getElementById('propsBody').addEventListener('input', scheduleSave);
 
 /* ========================================================================
@@ -1989,19 +2034,20 @@ document.getElementById('propsBody').addEventListener('input', scheduleSave);
    ======================================================================== */
 let hasLoadedDocument = false;
 
-async function startEditing(htmlString, key = DRAFT_PREFIX + 'sample', handle = null) {
-  flushDraft();
+async function startEditing(htmlString, handle = null, name = 'index.html') {
   deselectElement();
   editSavedContent = null;
-  currentDraftKey = key;
-  sourceFileHandle = handle;
   document.getElementById('welcomeScreen').classList.add('hidden');
   document.getElementById('canvasIframe').classList.remove('canvas-hidden');
   document.getElementById('editorTools').style.display = 'flex';
   await loadHTML(htmlString);
+  sourceFileHandle = handle;
+  sourceFileName = name;
+  sourceHTML = htmlString;
+  historyHTML = savedHTML = getDocHTML();
   undoStack = []; redoStack = [];
   updateUndoRedoButtons();
-  saveDraft();
+  setSaveStatus(handle ? '源文件已关联 · 每 3 秒检查更新' : '请点击“保存”关联源文件');
   showToast('已加载');
 }
 
@@ -2018,24 +2064,11 @@ document.addEventListener('transitionend', (e) => {
    ======================================================================== */
 function loadSample() {
   const sampleHTML = '<!DOCTYPE html>\n<html lang="zh-CN">\n<head>\n<meta charset="UTF-8">\n<style>\n  body{font-family:Inter,system-ui,sans-serif;max-width:680px;margin:60px auto;padding:0 24px;color:#1a1a1a;background:#fff;line-height:1.7}\n  h1{font-size:36px;font-weight:700;letter-spacing:-.03em;margin-bottom:8px}\n  .sub{font-size:18px;color:#666;margin-bottom:40px}\n  .card{background:#f9f9f7;border-radius:20px;padding:28px;margin:24px 0;border:1px solid #eee}\n  .card h2{font-size:20px;margin:0 0 12px}\n  .card p{color:#555;margin:0}\n  .btn{display:inline-block;padding:12px 28px;background:#111;color:#fff;border:none;border-radius:12px;font-size:15px;font-weight:600;cursor:pointer}\n  img{max-width:100%;border-radius:16px;margin:16px 0}\n</style>\n</head>\n<body>\n<h1>欢迎使用 HTML 编辑器</h1>\n<p class="sub">点击任意元素开始编辑，就像在修改设计稿</p>\n<div class="card">\n<h2>可视化编辑</h2>\n<p>选中元素后拖拽手柄调整大小，双击文字直接编辑，右侧面板精细调校样式。</p>\n</div>\n<p>这是一段可编辑的<strong>文本段落</strong>。你可以点击它，然后再次点击来放置光标进行编辑。</p>\n<button class="btn">示例按钮</button>\n</body>\n</html>';
-  startEditing(sampleHTML);
+  loadFile(new File([sampleHTML], 'sample.html', { type: 'text/html' }));
 }
 
-async function init() {
-  updateUndoRedoButtons();
-  try {
-    const key = localStorage.getItem(LAST_DRAFT_KEY);
-    const draft = key && readDraft(key);
-    if (draft) {
-      await startEditing(draft.html, key);
-      showToast('已恢复本机草稿');
-    }
-  } catch (e) {
-    setSaveStatus('本机草稿不可用，请导出 HTML', '#ef4444');
-  }
-}
-
-init();
+updateUndoRedoButtons();
+setInterval(syncSource, 3000);
 </script>
 </body>
 </html>
