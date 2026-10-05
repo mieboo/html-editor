@@ -307,10 +307,15 @@ body{
   display:block;
 }
 
-/* ===== Props panel ===== */
-.group-arrow{position:absolute;display:grid;place-items:center;width:22px;height:22px;transform:translate(-50%,-50%);border:1px solid #6d5dfc;border-radius:50%;background:#fff;color:#6d5dfc;font:700 16px/1 sans-serif;box-shadow:0 2px 6px #0002}
-.group-arrow[data-active]{background:#6d5dfc;color:#fff;outline:3px solid #6d5dfc40}
+/* ===== Drag structure overlay ===== */
+.group-box{position:absolute;outline:1px solid #6d5dfc80;outline-offset:-1px;color:#5144c9}
+.group-box[data-context]{outline:1px dashed #64748b99;color:#64748b}
+.group-box[data-hover]{outline-width:2px;outline-color:currentColor;background:#6d5dfc18;z-index:1}
+.group-arrow{position:absolute;display:grid;place-items:center;width:20px;height:20px;transform:translate(-50%,-50%);border:1px solid currentColor;border-radius:3px;background:#fff;font:700 14px/1 sans-serif;box-shadow:0 1px 3px #0002}
+.group-arrow[data-active]{background:#5144c9;color:#fff;outline:2px solid #fff}
+.group-label{position:absolute;z-index:2;max-width:min(380px,calc(100% - 12px));padding:5px 8px;border-radius:4px;background:#252538;color:#fff;font:12px/1.6 ui-monospace,monospace;white-space:pre;overflow:hidden;text-overflow:ellipsis;box-shadow:0 2px 8px #0003}
 
+/* ===== Props panel ===== */
 .props{
   border:1px solid var(--line);
   background:rgba(251,250,246,.76);
@@ -882,7 +887,7 @@ function setupIframeListeners() {
     win.addEventListener('scroll', () => {
       if (_moveData?.moved) drawGroupTargets();
       if (selectedElement) showHandles(selectedElement);
-    });
+    }, true);
   }
 
   // Drag move/up inside iframe — critical for smooth resize (iframe has own event context)
@@ -930,7 +935,7 @@ function createHandles() {
 }
 
 function showHandles(el) {
-  if (!el || !el.isConnected) { hideHandles(); return; }
+  if (!el || !el.isConnected || _moveData?.moved) { hideHandles(); return; }
   // Recreate if handles lost (e.g. after undo)
   if (handles.length === 0 || !handles[0].isConnected) createHandles();
 
@@ -1022,7 +1027,6 @@ function startResize(e, dir) {
 }
 
 let _resizeRAF = null;
-let _moveRAF = null;
 let _justMoved = false;
 
 function movePoint(e) {
@@ -1053,38 +1057,88 @@ function drawGroupTargets() {
   const move = _moveData;
   if (!move?.moved) return;
   if (!move.overlay) {
-    move.targets = [...getDoc().body.querySelectorAll('*')].filter(el => groupTag(el, move.el));
-    move.markers = new Map();
+    // Keep ancestors and restricted containers visible as structure, without drop arrows.
+    move.targets = [getDoc().body, ...getDoc().body.querySelectorAll('*')].filter(el =>
+      !move.el.contains(el) && !el.closest('.__ve-handle') && !/^(SCRIPT|STYLE|LINK|META|TEMPLATE|BR)$/.test(el.tagName));
+    move.boxes = new Map();
     move.overlay = document.createElement('div');
     move.overlay.id = 'groupDropTargets';
     move.overlay.setAttribute('aria-hidden', 'true');
     move.overlay.style.cssText = 'position:fixed;overflow:hidden;pointer-events:none;z-index:2000';
+    move.label = document.createElement('div');
+    move.label.className = 'group-label'; move.label.hidden = true;
+    move.overlay.appendChild(move.label);
     document.body.appendChild(move.overlay);
   }
   const frame = document.getElementById('canvasIframe'), f = frame.getBoundingClientRect();
-  const view = document.getElementById('canvasContainer').getBoundingClientRect(), zoom = parseFloat(frame.style.zoom) || 1;
+  const canvas = document.getElementById('canvasContainer').getBoundingClientRect(), zoom = parseFloat(frame.style.zoom) || 1;
+  const view = { left: Math.max(canvas.left, f.left), top: Math.max(canvas.top, f.top), right: Math.min(canvas.right, f.right), bottom: Math.min(canvas.bottom, f.bottom) };
+  view.width = Math.max(0, view.right - view.left); view.height = Math.max(0, view.bottom - view.top);
   move.view = view;
   Object.assign(move.overlay.style, { left: view.left + 'px', top: view.top + 'px', width: view.width + 'px', height: view.height + 'px' });
   move.points = [];
+  const clips = new Map(), slots = new Map();
+  const occupied = (x, y) => {
+    const cx = Math.floor(x / 22), cy = Math.floor(y / 22);
+    for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
+      if (slots.get((cx + dx) + ':' + (cy + dy))?.some(p => Math.abs(p.x - x) < 22 && Math.abs(p.y - y) < 22)) return true;
+    }
+    return false;
+  };
   for (const target of move.targets) {
-    const r = target.getBoundingClientRect();
+    const r = target.getBoundingClientRect(), style = getWin().getComputedStyle(target);
     const left = f.left + r.left * zoom, top = f.top + r.top * zoom, right = left + r.width * zoom, bottom = top + r.height * zoom;
-    const visible = target.isConnected && r.width > 0 && r.height > 0 && right > view.left && left < view.right && bottom > view.top && top < view.bottom && getWin().getComputedStyle(target).visibility === 'visible';
-    let markers = move.markers.get(target);
-    if (!visible) { markers?.forEach(el => el.remove()); move.markers.delete(target); continue; }
-    if (!markers) {
-      markers = ['←', '↑', '→', '↓'].map(text => {
+    const clip = clips.get(target.parentElement) || view, childClip = { ...clip };
+    if (/^(hidden|clip|auto|scroll)$/.test(style.overflowX)) {
+      childClip.left = Math.max(clip.left, left + target.clientLeft * zoom);
+      childClip.right = Math.min(clip.right, left + (target.clientLeft + target.clientWidth) * zoom);
+    }
+    if (/^(hidden|clip|auto|scroll)$/.test(style.overflowY)) {
+      childClip.top = Math.max(clip.top, top + target.clientTop * zoom);
+      childClip.bottom = Math.min(clip.bottom, top + (target.clientTop + target.clientHeight) * zoom);
+    }
+    clips.set(target, childClip);
+    const visible = target.isConnected && r.width > 0 && r.height > 0 && clip.right > clip.left && clip.bottom > clip.top && right > clip.left && left < clip.right && bottom > clip.top && top < clip.bottom && style.visibility === 'visible';
+    let item = move.boxes.get(target);
+    if (!visible) { item?.box.remove(); move.boxes.delete(target); continue; }
+    if (!item) {
+      const box = document.createElement('div'), groupable = !!groupTag(target, move.el);
+      box.className = 'group-box'; box.toggleAttribute('data-context', !groupable);
+      const markers = (groupable ? ['←', '↑', '→', '↓'] : []).map(text => {
         const marker = document.createElement('span');
         marker.className = 'group-arrow'; marker.textContent = text;
-        move.overlay.appendChild(marker); return marker;
+        box.appendChild(marker); return marker;
       });
-      move.markers.set(target, markers);
+      item = { target, box, markers };
+      move.overlay.appendChild(box); move.boxes.set(target, item);
     }
-    const ix = Math.min(12, r.width * zoom / 4), iy = Math.min(12, r.height * zoom / 4);
-    [[left + ix, (top + bottom) / 2], [(left + right) / 2, top + iy], [right - ix, (top + bottom) / 2], [(left + right) / 2, bottom - iy]].forEach(([x, y], side) => {
-      const marker = markers[side];
-      marker.style.left = (x - view.left) + 'px'; marker.style.top = (y - view.top) + 'px';
-      if (x >= view.left && x <= view.right && y >= view.top && y <= view.bottom) move.points.push({ target, side, marker, x, y });
+    Object.assign(item, { left, top, right, bottom, clip });
+    item.label = target.localName + (target.id ? '#' + target.id : [...target.classList].slice(0, 2).map(c => '.' + c).join('')) + ' · ' + style.display + ' · ' + Math.round(r.width) + ' × ' + Math.round(r.height);
+    Object.assign(item.box.style, { left: (left - view.left) + 'px', top: (top - view.top) + 'px', width: r.width * zoom + 'px', height: r.height * zoom + 'px',
+      clipPath: 'inset(' + [clip.top - top, right - clip.right, bottom - clip.bottom, clip.left - left].map(n => Math.max(-12, n) + 'px').join(' ') + ')' });
+    // Offset opposing arrows along the edge so adjacent boxes don't share a drop point.
+    [[left, top + (bottom - top) * 2 / 3], [left + (right - left) / 3, top], [right, top + (bottom - top) / 3], [left + (right - left) * 2 / 3, bottom]].forEach(([x, y], side) => {
+      const marker = item.markers[side];
+      if (!marker) return;
+      const vertical = side % 2 === 0;
+      const start = Math.max(vertical ? top : left, vertical ? clip.top : clip.left), end = Math.min(vertical ? bottom : right, vertical ? clip.bottom : clip.right);
+      const inset = Math.min(12, (end - start) / 2), min = start + inset, max = end - inset;
+      const base = Math.max(min, Math.min(max, vertical ? y : x));
+      if (vertical) y = base; else x = base;
+      // Shared parent/child edges also need distinct, individually reachable arrows.
+      for (let step = 1; occupied(x, y) && step <= Math.ceil((max - min) / 12); step++) {
+        const next = base + (step % 2 ? 1 : -1) * Math.ceil(step / 2) * 24;
+        if (next >= min && next <= max) { if (vertical) y = next; else x = next; }
+      }
+      marker.style.left = (x - left) + 'px'; marker.style.top = (y - top) + 'px';
+      const visible = x >= clip.left && x <= clip.right && y >= clip.top && y <= clip.bottom;
+      marker.style.display = visible ? 'grid' : 'none';
+      if (visible) {
+        const point = { target, side, marker, item, x, y }, key = Math.floor(x / 22) + ':' + Math.floor(y / 22);
+        move.points.push(point);
+        if (!slots.has(key)) slots.set(key, []);
+        slots.get(key).push(point);
+      }
     });
   }
   updateGroupTarget();
@@ -1095,8 +1149,14 @@ function updateGroupTarget() {
   if (!move?.point) return;
   const x = move.point.clientX, y = move.point.clientY;
   const view = move.view;
-  let drop = null, distance = x >= view.left && x <= view.right && y >= view.top && y <= view.bottom ? 15 : -1;
+  const inside = x >= view.left && x <= view.right && y >= view.top && y <= view.bottom;
+  let drop = null, hover = null, distance = inside ? 14 : -1;
+  for (const item of move.boxes.values()) {
+    if (inside && x >= Math.max(item.left, item.clip.left) && x <= Math.min(item.right, item.clip.right) && y >= Math.max(item.top, item.clip.top) && y <= Math.min(item.bottom, item.clip.bottom)) hover = item;
+  }
   for (const point of move.points || []) {
+    const clip = point.item.clip;
+    if (x < clip.left || x > clip.right || y < clip.top || y > clip.bottom) continue;
     const d = Math.hypot(point.x - x, point.y - y);
     if (d <= distance) { distance = d; drop = point; }
   }
@@ -1105,6 +1165,18 @@ function updateGroupTarget() {
     drop?.marker.setAttribute('data-active', '');
   }
   move.drop = drop;
+  hover = drop?.item || hover;
+  if (hover !== move.hover) {
+    move.hover?.box.removeAttribute('data-hover');
+    hover?.box.setAttribute('data-hover', '');
+    move.hover = hover;
+  }
+  move.label.hidden = !hover;
+  if (hover) {
+    move.label.textContent = hover.label + (drop ? '\n' + ['← 放在左侧 · 横向组合', '↑ 放在上方 · 纵向组合', '→ 放在右侧 · 横向组合', '↓ 放在下方 · 纵向组合'][drop.side] : '');
+    move.label.style.left = Math.max(6, Math.min(hover.left - view.left, view.width - 386)) + 'px';
+    move.label.style.top = Math.max(6, hover.top - view.top - (drop ? 56 : 34)) + 'px';
+  }
 }
 
 function groupElements(dragged, target, side) {
@@ -1194,12 +1266,7 @@ function onDragMove(e) {
     const el = _moveData.el;
     el.style.left = (_moveData.startLeft + dx) + 'px';
     el.style.top = (_moveData.startTop + dy) + 'px';
-    if (!_moveRAF) {
-      _moveRAF = requestAnimationFrame(() => {
-        _moveRAF = null;
-        if (_moveData && _moveData.el.isConnected) showHandles(_moveData.el);
-      });
-    }
+    if (_moveData.overlay) updateGroupTarget();
     return;
   }
 
@@ -1269,12 +1336,12 @@ function finishMove(e, cancel = false) {
     autoSizeIframe();
     if (el === selectedElement && el.isConnected) { showHandles(el); el.style.cursor = 'move'; }
   }
-  if (_moveRAF) { cancelAnimationFrame(_moveRAF); _moveRAF = null; }
 }
 
 document.addEventListener('mousemove', onDragMove);
 document.addEventListener('mouseup', onDragUp, true);
-document.getElementById('canvasContainer').addEventListener('scroll', drawGroupTargets);
+window.addEventListener('scroll', drawGroupTargets, true);
+window.addEventListener('resize', drawGroupTargets);
 window.addEventListener('blur', onDragUp);
 
 /* ========================================================================
