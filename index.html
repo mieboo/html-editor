@@ -311,8 +311,8 @@ body{
 .group-box{position:absolute;outline:1px solid #6d5dfc80;outline-offset:-1px;color:#5144c9}
 .group-box[data-context]{outline:1px dashed #64748b99;color:#64748b}
 .group-box[data-hover]{outline-width:2px;outline-color:currentColor;background:#6d5dfc18;z-index:1}
-.group-arrow{position:absolute;display:grid;place-items:center;width:20px;height:20px;transform:translate(-50%,-50%);border:1px solid currentColor;border-radius:3px;background:#fff;font:700 14px/1 sans-serif;box-shadow:0 1px 3px #0002}
-.group-arrow[data-active]{background:#5144c9;color:#fff;outline:2px solid #fff}
+.group-arrow{position:absolute;width:6px;height:6px;background:currentColor;clip-path:polygon(100% 0,100% 100%,0 50%)}
+.group-arrow[data-active]{color:#17172b}
 .group-label{position:absolute;z-index:2;max-width:min(380px,calc(100% - 12px));padding:5px 8px;border-radius:4px;background:#252538;color:#fff;font:12px/1.6 ui-monospace,monospace;white-space:pre;overflow:hidden;text-overflow:ellipsis;box-shadow:0 2px 8px #0003}
 
 /* ===== Props panel ===== */
@@ -666,6 +666,7 @@ let editSavedContent = null;
 let handles = [];
 let _toastTimer = null;
 let _mutationObserver = null;
+let editOutlineSheet = null;
 let _sizeRAF = null;
 let _scrubState = null;
 let _moveData = null;
@@ -784,8 +785,13 @@ function guardPreview(doc) {
 function setInteractiveMode(enabled) {
   finishEditing();
   interactiveMode = enabled;
+  showEditOutlines();
   deselectElement();
   autoSizeIframe();
+}
+
+function showEditOutlines(enabled = !interactiveMode && !_moveData?.moved) {
+  if (editOutlineSheet) editOutlineSheet.disabled = !enabled;
 }
 
 function zoomCanvas(step) {
@@ -818,6 +824,11 @@ function autoSizeIframe() {
 function setupIframeListeners() {
   const doc = getDoc();
   if (!doc) return;
+  // A constructed stylesheet follows layout without changing or serializing the source DOM.
+  editOutlineSheet = new (getWin().CSSStyleSheet)();
+  editOutlineSheet.replaceSync('body,body *:not(.__ve-handle){outline:1px solid #6d5dfc55!important;outline-offset:-1px!important}');
+  doc.adoptedStyleSheets.push(editOutlineSheet);
+  showEditOutlines();
   doc.addEventListener('input', scheduleSave, true);
   doc.addEventListener('keydown', onShortcut, true);
 
@@ -971,8 +982,8 @@ function selectElement(el) {
     styles: ['outline', 'outline-offset', 'cursor'].map(p => [p, el.style.getPropertyValue(p), el.style.getPropertyPriority(p)]),
     editable: el.getAttribute('contenteditable'), style: el.getAttribute('style'), cssText: el.style.cssText
   };
-  el.style.outline = '2px solid #6d5dfc';
-  el.style.outlineOffset = '2px';
+  el.style.setProperty('outline', '2px solid #6d5dfc', 'important');
+  el.style.setProperty('outline-offset', '2px', 'important');
   el.style.cursor = 'move';
   showHandles(el);
   updatePropsPanel(el);
@@ -985,8 +996,10 @@ function restoreSelection(el) {
   if (selectionState.editable === null) el.removeAttribute('contenteditable');
   else el.setAttribute('contenteditable', selectionState.editable);
   if (el.style.cssText === selectionState.cssText) {
-    if (selectionState.style === null) el.removeAttribute('style');
-    else el.setAttribute('style', selectionState.style);
+    if (selectionState.style === null) {
+      // Reading first synchronizes Chromium's pending inline style attribute.
+      if (el.hasAttribute('style')) el.removeAttribute('style');
+    } else el.setAttribute('style', selectionState.style);
   }
 }
 
@@ -1079,9 +1092,9 @@ function drawGroupTargets() {
   move.points = [];
   const clips = new Map(), slots = new Map();
   const occupied = (x, y) => {
-    const cx = Math.floor(x / 22), cy = Math.floor(y / 22);
+    const cx = Math.floor(x / 10), cy = Math.floor(y / 10);
     for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
-      if (slots.get((cx + dx) + ':' + (cy + dy))?.some(p => Math.abs(p.x - x) < 22 && Math.abs(p.y - y) < 22)) return true;
+      if (slots.get((cx + dx) + ':' + (cy + dy))?.some(p => Math.abs(p.x - x) < 10 && Math.abs(p.y - y) < 10)) return true;
     }
     return false;
   };
@@ -1104,9 +1117,10 @@ function drawGroupTargets() {
     if (!item) {
       const box = document.createElement('div'), groupable = !!groupTag(target, move.el);
       box.className = 'group-box'; box.toggleAttribute('data-context', !groupable);
-      const markers = (groupable ? ['←', '↑', '→', '↓'] : []).map(text => {
+      const markers = (groupable ? [0, 1, 2, 3] : []).map(side => {
         const marker = document.createElement('span');
-        marker.className = 'group-arrow'; marker.textContent = text;
+        marker.className = 'group-arrow';
+        marker.style.transform = 'translate(-50%,-50%) rotate(' + side * 90 + 'deg)';
         box.appendChild(marker); return marker;
       });
       item = { target, box, markers };
@@ -1116,25 +1130,27 @@ function drawGroupTargets() {
     item.label = target.localName + (target.id ? '#' + target.id : [...target.classList].slice(0, 2).map(c => '.' + c).join('')) + ' · ' + style.display + ' · ' + Math.round(r.width) + ' × ' + Math.round(r.height);
     Object.assign(item.box.style, { left: (left - view.left) + 'px', top: (top - view.top) + 'px', width: r.width * zoom + 'px', height: r.height * zoom + 'px',
       clipPath: 'inset(' + [clip.top - top, right - clip.right, bottom - clip.bottom, clip.left - left].map(n => Math.max(-12, n) + 'px').join(' ') + ')' });
-    // Offset opposing arrows along the edge so adjacent boxes don't share a drop point.
-    [[left, top + (bottom - top) * 2 / 3], [left + (right - left) / 3, top], [right, top + (bottom - top) / 3], [left + (right - left) * 2 / 3, bottom]].forEach(([x, y], side) => {
+    // Tiny arrows stay inside their box; opposing arrows use different positions along the edge.
+    const size = Math.min(6, right - left, bottom - top), ix = Math.min(5, (right - left) / 2), iy = Math.min(5, (bottom - top) / 2);
+    [[left + ix, top + (bottom - top) * 2 / 3], [left + (right - left) / 3, top + iy], [right - ix, top + (bottom - top) / 3], [left + (right - left) * 2 / 3, bottom - iy]].forEach(([x, y], side) => {
       const marker = item.markers[side];
       if (!marker) return;
       const vertical = side % 2 === 0;
       const start = Math.max(vertical ? top : left, vertical ? clip.top : clip.left), end = Math.min(vertical ? bottom : right, vertical ? clip.bottom : clip.right);
-      const inset = Math.min(12, (end - start) / 2), min = start + inset, max = end - inset;
+      const inset = Math.min(5, (end - start) / 2), min = start + inset, max = end - inset;
       const base = Math.max(min, Math.min(max, vertical ? y : x));
       if (vertical) y = base; else x = base;
       // Shared parent/child edges also need distinct, individually reachable arrows.
-      for (let step = 1; occupied(x, y) && step <= Math.ceil((max - min) / 12); step++) {
-        const next = base + (step % 2 ? 1 : -1) * Math.ceil(step / 2) * 24;
+      for (let step = 1; occupied(x, y) && step <= Math.ceil((max - min) / 6); step++) {
+        const next = base + (step % 2 ? 1 : -1) * Math.ceil(step / 2) * 12;
         if (next >= min && next <= max) { if (vertical) y = next; else x = next; }
       }
       marker.style.left = (x - left) + 'px'; marker.style.top = (y - top) + 'px';
+      marker.style.width = marker.style.height = size + 'px';
       const visible = x >= clip.left && x <= clip.right && y >= clip.top && y <= clip.bottom;
       marker.style.display = visible ? 'grid' : 'none';
       if (visible) {
-        const point = { target, side, marker, item, x, y }, key = Math.floor(x / 22) + ':' + Math.floor(y / 22);
+        const point = { target, side, marker, item, x, y }, key = Math.floor(x / 10) + ':' + Math.floor(y / 10);
         move.points.push(point);
         if (!slots.has(key)) slots.set(key, []);
         slots.get(key).push(point);
@@ -1150,7 +1166,7 @@ function updateGroupTarget() {
   const x = move.point.clientX, y = move.point.clientY;
   const view = move.view;
   const inside = x >= view.left && x <= view.right && y >= view.top && y <= view.bottom;
-  let drop = null, hover = null, distance = inside ? 14 : -1;
+  let drop = null, hover = null, distance = inside ? 8 : -1;
   for (const item of move.boxes.values()) {
     if (inside && x >= Math.max(item.left, item.clip.left) && x <= Math.min(item.right, item.clip.right) && y >= Math.max(item.top, item.clip.top) && y <= Math.min(item.bottom, item.clip.bottom)) hover = item;
   }
@@ -1246,6 +1262,7 @@ function onDragMove(e) {
     if (Math.abs(dx) < 3 && Math.abs(dy) < 3 && !_moveData.moved) return;
     if (!_moveData.moved) {
       _moveData.moved = true;
+      showEditOutlines();
       if (_moveData.wasStatic) _moveData.el.style.position = 'relative';
       // Store original visual state & apply drag feedback
       const el = _moveData.el;
@@ -1317,12 +1334,13 @@ function finishMove(e, cancel = false) {
   const drop = e?.type === 'mouseup' ? move.drop : null;
   move.overlay?.remove();
   _moveData = null;
+  showEditOutlines();
   el.style.cursor = '';
   document.body.style.cursor = '';
   if (move.moved) {
     // Restore visual state
-    el.style.outline = move._savedOutline || '';
-    el.style.outlineOffset = move._savedOutlineOffset || '';
+    el.style.setProperty('outline', move._savedOutline || '', 'important');
+    el.style.setProperty('outline-offset', move._savedOutlineOffset || '', 'important');
     el.style.boxShadow = move._savedBoxShadow || '';
     el.style.transition = move._savedTransition || '';
     el.style.zIndex = move._savedZIndex || '';
@@ -1364,8 +1382,8 @@ function isInlineText(el) {
 function startEditAtCursor(el, cx, cy) {
   if (interactiveMode || selectedElement !== el || !el.isConnected || editSavedContent !== null) return;
   hideHandles();
-  el.style.outline = '2px solid #f59e0b';
-  el.style.outlineOffset = '2px';
+  el.style.setProperty('outline', '2px solid #f59e0b', 'important');
+  el.style.setProperty('outline-offset', '2px', 'important');
   el.contentEditable = 'true';
   editSavedContent = el.innerHTML;
 
@@ -1423,8 +1441,8 @@ function onEditKey(e) {
 function commitEdit(el) {
   restoreSelection(el);
   if (el === selectedElement) {
-    el.style.outline = '2px solid #6d5dfc';
-    el.style.outlineOffset = '2px';
+    el.style.setProperty('outline', '2px solid #6d5dfc', 'important');
+    el.style.setProperty('outline-offset', '2px', 'important');
     showHandles(el);
   } else {
     el.style.outline = '';
@@ -1999,6 +2017,8 @@ async function exportPNG() {
   const doc = getDoc();
   if (!doc || !doc.body) { showToast('没有可导出的内容'); return; }
   deselectElement();
+  const outlines = editOutlineSheet;
+  showEditOutlines(false);
   showToast('正在生成全页 PNG...');
   try {
     const body = doc.body;
@@ -2023,6 +2043,8 @@ async function exportPNG() {
   } catch(e) {
     showToast('PNG 导出失败: ' + e.message);
     console.error(e);
+  } finally {
+    if (outlines === editOutlineSheet) showEditOutlines();
   }
 }
 
@@ -2030,6 +2052,8 @@ async function composeImage() {
   const doc = getDoc();
   if (!doc || !doc.body) { showToast('没有可合成的内容'); return; }
   deselectElement();
+  const outlines = editOutlineSheet;
+  showEditOutlines(false);
   showToast('正在合成全页图片...');
   try {
     const body = doc.body;
@@ -2054,6 +2078,8 @@ async function composeImage() {
   } catch(e) {
     showToast('合成失败: ' + e.message);
     console.error(e);
+  } finally {
+    if (outlines === editOutlineSheet) showEditOutlines();
   }
 }
 
